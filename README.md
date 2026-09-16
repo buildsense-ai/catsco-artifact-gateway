@@ -42,9 +42,9 @@ npm audit --omit=dev --registry=https://registry.npmjs.org
 先由管理员通过可信渠道提供 Gateway **公钥**；不得跳过主机验证或静默信任 ssh-keyscan 结果。发布包目录和状态目录都放在用户可写位置。
 
 ```sh
-node scripts/init-connector.mjs /absolute/user/state demo preview.example.com \
+node scripts/init-connector.mjs /absolute/user/state demo artifact.example.com \
   22443 28191 20171 /absolute/gateway_host.pub \
-  wss://preview.example.com/_cag_p0/tunnel
+  wss://artifact.example.com/_gateway/tunnel
 ```
 
 初始化生成本地私钥（不会上传）、known_hosts、connector.json，只输出登记所需公钥。管理员将公钥与应用 ID/端口绑定后：
@@ -63,14 +63,14 @@ node scripts/local-demo.mjs stop /absolute/user/state/connector.json
 
 ## Gateway 配置
 
-见 [部署与回滚](docs/DEPLOYMENT.md)。`scripts/render.mjs CONFIG OUTPUT` 生成 sshd、authorizedKeys、Nginx http 级配置和 preview vhost 的 location include；部署前必须执行 `sshd -t` 与 `nginx -t`。
+见 [部署与回滚](docs/DEPLOYMENT.md)。`scripts/render.mjs CONFIG OUTPUT` 生成 sshd、authorizedKeys、Nginx http 级配置和独立 Artifact vhost 的 location include；部署前必须执行 `sshd -t` 与 `nginx -t`。
 
 ## 明确不包含
 
 1. 不包含会话注入、账户身份、Bot 自动注册，未修改 XiaoBa/CatsCompany 核心。
 2. 不包含新 Artifact 列表 UI 或旧 Artifact 删除。旧系统保持运行。
 3. 目前管理员登记应用，尚不是自助一键发布 API。
-4. 测试借用独立 preview 站点的 `/_cag_p0/` 路径。**不是多应用浏览器安全隔离方案**：共享 origin 的 localStorage 等仍共享。只部署本仓库可信、可丢弃 demo；禁止上传任意 Agent 生成的页面。正式版本需每应用独立 origin、通配 DNS/TLS。
+4. 独立双域名 `artifact.catsco.cc`、`artifact.catsco.cn` 使用 `/<app-id>/` 路径；两个域名无强制跳转，均可访问全部应用。**不是多应用浏览器安全隔离方案**：共享 origin 的 localStorage 等仍共享。只部署本仓库可信、可丢弃 demo；禁止上传任意 Agent 生成的页面。如需运行互不信任的应用，必须另行解决应用间浏览器隔离；路径本身不是隔离边界。
 5. P0 会剥离 Cookie/Set-Cookie，限制 CSP 和 1MB 请求体；不支持应用登录 Cookie。正式隔离域名完成后再定义这些策略。
 6. SSH+WSS 会增加进程数与加密开销，尚未压力测试。每应用一个连接只是两机验证方案。
 7. 网络只需出站 443，但仍需允许 WebSocket；强制企业代理/拦截场景未验证。
