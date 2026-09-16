@@ -1,0 +1,18 @@
+[Unit]
+Description=CatsCo Artifact Gateway P0 isolated SSH transport
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/sshd -t -f /etc/catsco-artifact-gateway/sshd
+ExecStart=/usr/sbin/sshd -D -e -f /etc/catsco-artifact-gateway/sshd
+Restart=on-failure
+RestartSec=5
+MemoryMax=128M
+TasksMax=128
+LimitNOFILE=8192
+CPUQuota=25%
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

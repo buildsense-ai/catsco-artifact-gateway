@@ -1,0 +1,24 @@
+[Unit]
+Description=CatsCo Artifact Gateway P0 unprivileged connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=cag_demo
+Group=cag_demo
+WorkingDirectory=/var/lib/cag-demo
+ExecStart=/usr/bin/node /opt/catsco-artifact-gateway/src/connector.mjs /var/lib/cag-demo/connector.json
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=5
+TimeoutStopSec=8
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cag-demo
+MemoryMax=64M
+TasksMax=24
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

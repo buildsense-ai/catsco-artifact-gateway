@@ -1,0 +1,22 @@
+[Unit]
+Description=CatsCo Artifact Gateway P0 WSS transport adapter
+After=network.target catsco-artifact-gateway-p0.service
+
+[Service]
+User=cag_ingress
+Group=cag_ingress
+WorkingDirectory=/opt/catsco-artifact-gateway
+ExecStart=/usr/local/bin/node /opt/catsco-artifact-gateway/src/ws-gateway.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+MemoryMax=128M
+TasksMax=32
+LimitNOFILE=1024
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

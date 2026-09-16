@@ -1,0 +1,17 @@
+{
+  "name": "catsco-artifact-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "connector": "node src/connector.mjs",
+    "demo": "node demo/server.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}

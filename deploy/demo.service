@@ -1,0 +1,24 @@
+[Unit]
+Description=CatsCo Artifact Gateway P0 disposable local demo
+After=network.target
+
+[Service]
+User=cag_demo
+Group=cag_demo
+WorkingDirectory=/var/lib/cag-demo
+Environment=APP_ID=saturday-demo
+Environment=PORT=20171
+Environment=DATA_DIR=/var/lib/cag-demo/data
+ExecStart=/usr/bin/node /opt/catsco-artifact-gateway/demo/server.mjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cag-demo
+MemoryMax=128M
+TasksMax=32
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
