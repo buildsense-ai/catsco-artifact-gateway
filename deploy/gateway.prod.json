@@ -1,0 +1,22 @@
+{
+  "sshPort": 22443,
+  "user": "cag_ingress",
+  "publicHosts": ["artifact.catsco.cc", "artifact.catsco.cn"],
+  "hostKey": "/etc/catsco-artifact-gateway/ssh_host_ed25519_key",
+  "authorizedKeys": "/etc/catsco-artifact-gateway/authorized_keys",
+  "controlPort": 22445,
+  "apps": [
+    {
+      "id": "saturday-demo",
+      "title": "Saturday 演示应用",
+      "remotePort": 28191,
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIW1j0l5w5dXeAc5zkvoaWfM72+OuDAsUkBabXKK4AYX saturday-demo"
+    },
+    {
+      "id": "standard-demo",
+      "title": "标准服务器演示应用",
+      "remotePort": 28192,
+      "publicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEO38DVP3N/6N7chPeRH0G8ls9G2gA2QXiTiE0mj127i standard-demo"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+[Unit]
+Description=CatsCo Artifact Gateway control plane (application list and viewer identity)
+After=network.target catsco-artifact-gateway-p0.service
+
+[Service]
+User=cag_ingress
+Group=cag_ingress
+WorkingDirectory=/opt/catsco-artifact-gateway
+EnvironmentFile=/etc/catsco-artifact-gateway/control-plane.env
+Environment=CAG_CONFIG=/etc/catsco-artifact-gateway/gateway.json
+ExecStart=/usr/local/bin/node /opt/catsco-artifact-gateway/src/control-plane.mjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=catsco-artifact-gateway
+MemoryMax=128M
+TasksMax=32
+LimitNOFILE=1024
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target

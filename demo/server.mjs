@@ -4,14 +4,28 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { port, name } from '../src/config.mjs';
 const appId = name(process.env.APP_ID || 'demo');
+const gatewayBase = process.env.GATEWAY_BASE || 'https://artifact.catsco.cc';
 const dataDir = process.env.DATA_DIR || './data';
 fs.mkdirSync(dataDir, { recursive: true });
 const statePath = path.join(dataDir, 'state.json');
 let state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { count: 0 };
 function save() { fs.writeFileSync(`${statePath}.tmp`, JSON.stringify(state)); fs.renameSync(`${statePath}.tmp`, statePath); }
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const reply = (status, body, type='application/json') => { res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(type === 'application/json' ? JSON.stringify(body) : body); };
+  // Reference integration. The application forwards whatever credential the
+  // caller presented (cookie or bearer) to the gateway and reads the answer; it
+  // never parses a ticket and never decides identity by itself.
+  if (url.pathname === '/api/whoami' && req.method === 'GET') {
+    try {
+      const upstream = await fetch(`${gatewayBase}/_gateway/me?app=${encodeURIComponent(appId)}`, {
+        headers: { cookie: req.headers.cookie || '', authorization: req.headers.authorization || '' },
+      });
+      return reply(upstream.status, await upstream.json());
+    } catch {
+      return reply(502, { error: 'identity_unavailable' });
+    }
+  }
   if (url.pathname === '/health') return reply(200, { ok: true, appId, uid: process.getuid?.(), pid: process.pid });
   if (url.pathname === '/api/state' && req.method === 'GET') return reply(200, { appId, ...state });
   if (url.pathname === '/api/increment' && req.method === 'POST') {
