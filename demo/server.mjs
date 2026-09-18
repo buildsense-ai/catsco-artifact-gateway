@@ -10,6 +10,91 @@ fs.mkdirSync(dataDir, { recursive: true });
 const statePath = path.join(dataDir, 'state.json');
 let state = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : { count: 0 };
 function save() { fs.writeFileSync(`${statePath}.tmp`, JSON.stringify(state)); fs.renameSync(`${statePath}.tmp`, statePath); }
+
+// The page is built as a plain string so nothing in it is interpolated twice.
+const page = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>轻 Artifact 验证</title><style>
+body{margin:0;background:#eff3ec;color:#214535;font:17px/1.7 sans-serif}
+main{max-width:700px;margin:56px auto;padding:30px}
+h1{font-size:32px;margin:8px 0 14px}
+section{background:white;padding:26px;border-radius:16px;margin:18px 0}
+button{padding:11px 22px;border:0;border-radius:9px;background:#d5e8cc;cursor:pointer;font-size:16px}
+a{color:#214535}
+strong{font-size:42px}
+small{display:block;color:#607465}
+.identity{border:2px solid #b9d4ae}
+.identity strong{font-size:22px}
+.identity p{margin:8px 0;color:#3c5a4b;word-break:break-all}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;background:#d5e8cc;font-size:13px;color:#214535;margin-left:6px}
+.badge.guest{background:#f0e0c8}
+</style><main>
+<small>CAT SCO / 独立原型 · 非正式 Artifact</small>
+<h1>本地应用，公网可达。</h1>
+<p>应用：<b>${appId}</b> · 服务运行 UID：${process.getuid?.()}</p>
+
+<section class="identity" id="identity-card">
+  <small>打开者身份（应用后端转发凭据后，向网关 <code>/_gateway/me</code> 查询所得）</small>
+  <strong id="identity-state">检测中…</strong>
+  <p id="identity-detail"></p>
+  <p>
+    <button id="identity-refresh">重新获取身份</button>
+    <button id="identity-confirm" hidden>去确认身份</button>
+    <a id="identity-guest" hidden href="?identity=guest">以访客身份继续</a>
+  </p>
+</section>
+
+<section><small>数据保存在 Bot 本地 JSON，刷新后仍保留。</small><strong id="count">…</strong>
+<p><button id="add">计数 +1</button>　<a href="download">下载 JSON</a></p><p id="error" role="status"></p></section>
+<small id="stream">正在连接事件流…</small>
+<p>本演示计数器公开可写，不含任何真实业务数据。连接器不会调用模型。</p>
+</main><script>
+var APP_ID = ${JSON.stringify(appId)};
+var framed = window.top !== window;
+function el(id){ return document.getElementById(id); }
+function setIdentity(state, detail){ el('identity-state').textContent = state; el('identity-detail').textContent = detail || ''; }
+function show(id, on){ el(id).hidden = !on; }
+function startHandshake(){ location.replace('/_auth/start?app=' + encodeURIComponent(APP_ID) + '&next=' + encodeURIComponent(location.pathname)); }
+async function loadIdentity(auto){
+  setIdentity('检测中…', '正在查询网关 /_gateway/me');
+  try {
+    var me = await (await fetch('/api/whoami', { cache: 'no-store' })).json();
+    if (!me) { setIdentity('未检测到身份', '网关没有返回内容'); return; }
+    if (me.authenticated) {
+      setIdentity('已确认身份' + (framed ? '（侧栏内）' : ''), '');
+      el('identity-detail').textContent = '使用者 ' + me.viewer.id + '（' + me.viewer.kind + '） · 应用 ' + me.app_id
+        + (me.topic_id ? ' · 来自会话 ' + me.topic_id : ' · 无会话（直接打开网址）')
+        + ' · 有效期至 ' + me.expires_at;
+      show('identity-guest', false); show('identity-confirm', false); return;
+    }
+    if (framed) {
+      setIdentity('访客（侧栏内）', '在侧栏内无法发起身份确认，请用应用列表里的「新页面打开」');
+      show('identity-guest', false); show('identity-confirm', false); return;
+    }
+    if (new URLSearchParams(location.search).get('identity') === 'guest') {
+      setIdentity('访客（你选择了以访客继续）', '需要身份时点「去确认身份」');
+      show('identity-guest', false); show('identity-confirm', true); return;
+    }
+    setIdentity('未检测到身份', '正在自动前往平台确认身份…');
+    show('identity-guest', false); show('identity-confirm', false);
+    if (auto) startHandshake();
+  } catch (e) { setIdentity('无法获取身份', String((e && e.message) || e)); }
+}
+el('identity-refresh').onclick = function(){ loadIdentity(true); };
+el('identity-confirm').onclick = startHandshake;
+async function update(increment){
+  try {
+    var r = await fetch(increment ? 'api/increment' : 'api/state', { method: increment ? 'POST' : 'GET' });
+    if (!r.ok) throw Error('请求失败 ' + r.status);
+    var s = await r.json(); el('count').textContent = s.count; el('error').textContent = '';
+  } catch (e) { el('error').textContent = e.message; }
+}
+el('add').onclick = function(){ update(true); };
+update(false);
+var stream = new EventSource('events');
+stream.onmessage = function(e){ el('stream').textContent = '实时事件流正常 · ' + JSON.parse(e.data).tick; };
+stream.onerror = function(){ el('stream').textContent = '事件流断开，等待恢复'; };
+loadIdentity(true);
+</script></html>`;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const reply = (status, body, type='application/json') => { res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store' }); res.end(type === 'application/json' ? JSON.stringify(body) : body); };
@@ -43,7 +128,7 @@ const server = http.createServer(async (req, res) => {
     let tick = 0; const t = setInterval(() => res.write(`data: ${JSON.stringify({ appId, tick: ++tick })}\n\n`), 1000);
     req.on('close', () => clearInterval(t)); return;
   }
-  if (url.pathname === '/' && req.method === 'GET') return reply(200, `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>轻 Artifact 验证</title><style>body{margin:0;background:#eff3ec;color:#214535;font:17px/1.7 sans-serif}main{max-width:700px;margin:70px auto;padding:30px}h1{font-size:34px}section{background:white;padding:28px;border-radius:16px;margin:20px 0}button,a{color:#214535}button{padding:12px 24px;border:0;border-radius:9px;background:#d5e8cc;cursor:pointer}strong{font-size:42px}small{display:block;color:#607465}</style><main><small>CAT SCO / 独立原型 · 非正式 Artifact</small><h1>本地应用，公网可达。</h1><p>应用：<b>${appId}</b> · 服务运行 UID：${process.getuid?.()}</p><section><small>数据保存在 Bot 本地 JSON，刷新后仍保留。</small><strong id="count">…</strong><p><button id="add">计数 +1</button>　<a href="download">下载 JSON</a></p><p id="error" role="status"></p></section><small id="stream">正在连接事件流…</small><p>本演示计数器公开可写，不含任何真实业务数据。连接器不会调用模型。</p></main><script>async function update(increment=false){try{const r=await fetch(increment?'api/increment':'api/state',{method:increment?'POST':'GET'});if(!r.ok)throw Error('请求失败 '+r.status);const s=await r.json();document.getElementById('count').textContent=s.count;document.getElementById('error').textContent=''}catch(e){document.getElementById('error').textContent=e.message}}document.getElementById('add').onclick=()=>update(true);update();const s=new EventSource('events');s.onmessage=e=>{document.getElementById('stream').textContent='实时事件流正常 · '+JSON.parse(e.data).tick};s.onerror=()=>document.getElementById('stream').textContent='事件流断开，等待恢复';(async()=>{try{const me=await fetch('/api/whoami').then(r=>r.json());if(!me)return;const framed=window.top!==window;if(!me.authenticated){if(framed){document.getElementById('stream').textContent='当前以访客身份浏览：在侧栏内无法发起身份确认，用「新页面打开」可按正常流程确认身份';return}if(new URLSearchParams(location.search).get('identity')==='guest')return;location.replace('/_auth/start?app='+encodeURIComponent(${JSON.stringify(appId)})+'&next='+encodeURIComponent(location.pathname));return}document.getElementById('stream').textContent=(framed?'侧栏内':'')+'已确认身份 · '+me.viewer.id+(me.topic_id?' · 会话 '+me.topic_id:'')}catch{}})();</script></html>`, 'text/html; charset=utf-8');
+  if (url.pathname === '/' && req.method === 'GET') return reply(200, page, 'text/html; charset=utf-8');
   reply(404, { error: 'not_found' });
 });
 // Minimal server-to-client WebSocket probe, no arbitrary message execution.
