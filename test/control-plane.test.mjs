@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, buildAppList } from '../src/control-plane.mjs';
+import { createControlPlane, buildAppList, safeNext, handshakeTarget } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -28,7 +28,7 @@ function tmpState() {
 
 async function withServer(fn, options = {}) {
   const store = new ViewerStore({ file: tmpState(), ...options });
-  const server = createControlPlane({ config: CONFIG, store, controlToken: CONTROL_TOKEN, cookieSecure: false, corsOrigins: ['https://app.example.cc'], logger: { error() {} } });
+  const server = createControlPlane({ config: CONFIG, store, controlToken: CONTROL_TOKEN, cookieSecure: false, corsOrigins: ['https://app.example.cc'], handshakeUrl: options.handshakeUrl, logger: { error() {} } });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try { return await fn({ base, store }); } finally { await new Promise(resolve => server.close(resolve)); }
@@ -199,4 +199,67 @@ test('gateway exposes the control plane and lets applications read their own coo
   assert.ok(!renderGateway({ ...CONFIG, controlPort: undefined }).locations.includes('/_gateway/me'), 'control routes are optional');
   for (const controlPort of [80, '22445', 0]) assert.throws(() => renderGateway({ ...CONFIG, controlPort }));
   assert.throws(() => renderGateway({ ...CONFIG, controlPort: 28191 }), 'control port must not collide with an application');
+});
+
+test('return paths stay inside the requesting application', () => {
+  assert.equal(safeNext('/demo/page.html', 'demo'), '/demo/page.html');
+  assert.equal(safeNext('/demo/', 'demo'), '/demo/');
+  for (const hostile of [
+    'https://evil.example/',
+    '//evil.example/',
+    '/other/',
+    '/demo/../../etc',
+    '/demo/x\\y',
+    null,
+    '',
+    'x'.repeat(600),
+  ]) assert.equal(safeNext(hostile, 'demo'), '/demo/', `must be rejected: ${hostile}`);
+});
+
+test('handshake target carries the application and the return path', () => {
+  const target = new URL(handshakeTarget('https://app.example.cc/artifact-auth', 'demo', '/demo/page.html'));
+  assert.equal(target.origin, 'https://app.example.cc');
+  assert.equal(target.pathname, '/artifact-auth');
+  assert.equal(target.searchParams.get('app'), 'demo');
+  assert.equal(target.searchParams.get('next'), '/demo/page.html');
+});
+
+test('an application without a credential is sent to the platform handshake', async () => {
+  await withServer(async ({ base }) => {
+    const res = await fetch(`${base}/_auth/start?app=demo&next=%2Fdemo%2Findex.html`, { redirect: 'manual' });
+    assert.equal(res.status, 302);
+    const location = new URL(res.headers.get('location'));
+    assert.equal(location.origin, 'https://app.catsco.cc');
+    assert.equal(location.pathname, '/artifact-auth');
+    assert.equal(location.searchParams.get('app'), 'demo');
+    assert.equal(location.searchParams.get('next'), '/demo/index.html');
+
+    const hostile = await fetch(`${base}/_auth/start?app=demo&next=https%3A%2F%2Fevil.example%2F`, { redirect: 'manual' });
+    assert.equal(new URL(hostile.headers.get('location')).searchParams.get('next'), '/demo/', 'open redirect must not survive');
+
+    const unknown = await fetch(`${base}/_auth/start?app=ghost`, { redirect: 'manual' });
+    assert.equal(unknown.status, 404);
+
+    const wrongMethod = await fetch(`${base}/_auth/start?app=demo`, { method: 'POST' });
+    assert.equal(wrongMethod.status, 405);
+  });
+});
+
+test('a failed handshake offers login or guest instead of silently continuing', async () => {
+  await withServer(async ({ base }) => {
+    const res = await fetch(`${base}/_auth/declined?app=demo&next=%2Fdemo%2F`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/html/);
+    const html = await res.text();
+    assert.ok(html.includes('/_auth/start?app=demo'));
+    assert.ok(html.includes('identity=guest'));
+    assert.ok(html.includes('/demo/'));
+    assert.match(res.headers.get('content-security-policy'), /default-src 'none'/);
+    assert.equal((await fetch(`${base}/_auth/declined?app=ghost`)).status, 404);
+  });
+});
+
+test('the rendered gateway routes the auth handshake to the control plane', () => {
+  assert.ok(renderGateway(CONFIG).locations.includes('location ^~ /_auth/'));
+  assert.ok(!renderGateway({ ...CONFIG, controlPort: undefined }).locations.includes('/_auth/'));
 });
