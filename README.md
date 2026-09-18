@@ -39,13 +39,26 @@ npm audit --omit=dev --registry=https://registry.npmjs.org
 
 ## Bot 侧初始化（以 Agent 用户执行）
 
+完整的 Bot 视角说明见 **[给 Bot 的 Artifact 指南](docs/BOT-GUIDE.md)**；下面是命令摘要。
+
 先由管理员通过可信渠道提供 Gateway **公钥**；不得跳过主机验证或静默信任 ssh-keyscan 结果。发布包目录和状态目录都放在用户可写位置。
 
 ```sh
 node scripts/init-connector.mjs /absolute/user/state demo artifact.example.com \
   22443 28191 20171 /absolute/gateway_host.pub \
-  wss://artifact.example.com/_gateway/tunnel
+  wss://artifact.example.com/_gateway/tunnel \
+  --agent "$CATSCOMPANY_BOT_UID" --title "我的看板"
 ```
+
+`--agent` 声明这个应用属于哪个 bot（从 `CATSCOMPANY_BOT_UID` 读）。它决定应用出现在谁的侧栏里：**没有声明归属的应用不会出现在任何 bot 的侧栏**。初始化会写 `registration.json`，把它交给网关侧登记：
+
+```sh
+node scripts/register-app.mjs /etc/catsco-artifact-gateway/gateway.json <registration.json>
+node scripts/register-app.mjs /etc/catsco-artifact-gateway/gateway.json --list     # 查看每个应用的归属
+node scripts/register-app.mjs /etc/catsco-artifact-gateway/gateway.json --remove <应用id>   # 下架
+```
+
+侧栏按 bot 取列表：`GET /api/apps?agent=<bot uid>`，只返回该 bot 的应用。
 
 初始化生成本地私钥（不会上传）、known_hosts、connector.json，只输出登记所需公钥。管理员将公钥与应用 ID/端口绑定后：
 

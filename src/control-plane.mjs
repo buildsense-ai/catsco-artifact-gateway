@@ -126,13 +126,15 @@ a.primary{background:#1f6feb;color:#fff}a.secondary{border:1px solid #2a2f3a;col
 <a class="secondary" href="${guest}">以访客身份继续</a></main></html>`;
 }
 
-// Applications may declare the Bot they belong to; when a caller asks for one
-// Bot, applications without a declared owner stay visible to everyone so the
-// list keeps working before every application is annotated.
+// Ownership is what keeps one bot's applications out of another bot's sidebar.
+// An application that does not declare an owning bot is deliberately not
+// returned to a bot-scoped caller: it belongs to no bot, so it appears in no
+// bot's sidebar. Only an unscoped caller (an operator or a future fleet view)
+// sees it.
 export function buildAppList(config, { updatedAt = null, agent = null } = {}) {
   const host = config.publicHosts[0];
   return (config.apps || [])
-    .filter(app => agent === null || app.agent === undefined || String(app.agent) === agent)
+    .filter(app => agent === null || String(app.agent) === agent)
     .map(app => ({
       id: app.id,
       title: typeof app.title === 'string' && app.title.trim() ? app.title.trim() : app.id,

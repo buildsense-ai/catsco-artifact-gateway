@@ -1,4 +1,4 @@
-import { name, port } from './config.mjs';
+import { appTitle, botUid, name, port } from './config.mjs';
 
 // P0 only: trusted disposable demos, not arbitrary untrusted HTML hosting.
 export function renderGateway(c) {
@@ -13,6 +13,8 @@ export function renderGateway(c) {
     name(a.id); port(a.remotePort);
     if (ids.has(a.id) || ports.has(a.remotePort)) throw new Error('Duplicate application/port');
     ids.add(a.id); ports.add(a.remotePort);
+    if (a.agent !== undefined) botUid(a.agent);
+    if (a.title !== undefined) appTitle(a.title);
     if (!/^ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?$/.test(a.publicKey)) throw new Error('Expected ed25519 public key');
     const key = a.publicKey.split(' ')[1];
     if (keys.has(key)) throw new Error('Each application must use a distinct key');

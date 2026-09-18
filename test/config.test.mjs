@@ -10,6 +10,22 @@ test('connector pins host and binds only loopback without a remote shell', () =>
 test('reject command injection and invalid ports', () => {
   for (const patch of [{ host: '-oProxyCommand=evil' }, { user: 'root\nPermitRootLogin yes' }, { localPort: 80 }, { remotePort: '28191' }, { identityFile: '/key\n' }]) assert.throws(() => validateConnector({ ...c, ...patch }));
 });
+test('connector records a declared owner and stays valid without one', () => {
+  assert.equal(validateConnector({ ...c, agent: '365', title: '演示' }).agent, '365');
+  assert.ok(validateConnector({ ...c }), 'a connector generated before ownership was recorded must keep working');
+  for (const agent of ['bot', '0', '-1', 365.5, '', null]) assert.throws(() => validateConnector({ ...c, agent }));
+  assert.throws(() => validateConnector({ ...c, title: ' ' }));
+  assert.throws(() => validateConnector({ ...c, title: 'x'.repeat(61) }));
+});
+test('gateway validates application ownership', () => {
+  assert.equal(renderGateway({ ...g, apps: [{ ...g.apps[0], agent: '365', title: '演示' }] }).locations.includes('location ^~ /demo/'), true);
+  for (const agent of ['bot', '0', 0, '', 1.5]) assert.throws(() => renderGateway({ ...g, apps: [{ ...g.apps[0], agent }] }));
+  assert.throws(() => renderGateway({ ...g, apps: [{ ...g.apps[0], title: '' }] }));
+  assert.throws(() => renderGateway({ ...g, apps: [{ ...g.apps[0], title: 'x'.repeat(61) }] }));
+  // Ownership is optional in the schema: an application without it renders, but
+  // no bot-scoped caller will ever receive it.
+  assert.ok(renderGateway({ ...g, apps: [{ ...g.apps[0] }] }).locations.includes('location ^~ /demo/'));
+});
 test('WSS wrapper preserves SSH pinning and rejects proxy command injection', () => {
   const args = sshArgs({ ...c, transportUrl: 'wss://artifact.example.cc/_gateway/tunnel' });
   assert.ok(args.some(x => x.startsWith('ProxyCommand=')));
@@ -29,8 +45,7 @@ test('reject duplicate routes and configuration injection', () => {
   assert.throws(() => renderGateway({ ...g, apps: [g.apps[0], { ...g.apps[0], id: 'other', remotePort: 28192 }] }));
 });
 
-test('both domains expose identical root app paths, without preview dependency', () => {
-  const r = renderGateway(g);
+test('both domains expose identical root app paths, without preview dependency', () => {  const r = renderGateway(g);
   assert.ok(r.locations.includes('location ^~ /demo/'));
   assert.ok(r.locations.includes('location = /_gateway/tunnel'));
   for (const host of g.publicHosts) assert.ok(r.locations.includes(`https://${host}/demo/`));
