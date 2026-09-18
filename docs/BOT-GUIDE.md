@@ -71,6 +71,8 @@ if (me && me.authenticated === false && window.top === window) {   // 只在顶�
 
 参考实现：`demo/server.mjs` 的 `/api/whoami`（转发凭据）+ 首页脚本（顶层握手）。
 
+> **页面里的请求一律用相对路径。** 应用被服务在 `/<app-id>/` 下，所以页面里要写 `fetch('api/whoami')` 而不是 `fetch('/api/whoami')`：带前导斜杠会解析成网关根路径，既打到别处、也不在页面 CSP 的 `connect-src .../<app-id>/` 允许范围内（浏览器表现为 `Failed to fetch`）。跳转到 `/_auth/start`、`/_launch/:code` 这类**网关控制面**地址时才用带斜杠的绝对路径。
+
 ## 5. 发布四步
 
 ```sh

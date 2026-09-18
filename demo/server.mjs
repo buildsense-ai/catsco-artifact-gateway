@@ -56,7 +56,9 @@ function startHandshake(){ location.replace('/_auth/start?app=' + encodeURICompo
 async function loadIdentity(auto){
   setIdentity('检测中…', '正在查询网关 /_gateway/me');
   try {
-    var me = await (await fetch('/api/whoami', { cache: 'no-store' })).json();
+    // Relative on purpose: the application is served under /<app-id>/, so an
+    // absolute '/api/...' would leave the application and hit the gateway root.
+    var me = await (await fetch('api/whoami', { cache: 'no-store' })).json();
     if (!me) { setIdentity('未检测到身份', '网关没有返回内容'); return; }
     if (me.authenticated) {
       setIdentity('已确认身份' + (framed ? '（侧栏内）' : ''), '');
