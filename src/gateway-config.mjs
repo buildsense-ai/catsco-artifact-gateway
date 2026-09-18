@@ -24,6 +24,7 @@ export function renderGateway(c) {
 location = /_gateway/health { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
 location = /_gateway/me { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie $http_cookie; proxy_set_header Authorization $http_authorization; proxy_buffering off; limit_req zone=cag_p0_requests burst=20 nodelay; limit_conn cag_p0_connections 20; }
 location = /_gateway/codes { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
+location ^~ /_auth/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
 location ^~ /_launch/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
 `;
   return {

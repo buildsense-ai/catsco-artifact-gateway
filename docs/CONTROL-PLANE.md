@@ -10,6 +10,8 @@ CatsCompany sidebar ──GET /api/apps─────────────�
 CatsCompany backend ──POST /_gateway/codes (control token)───► one-time code
 browser (new tab)   ──GET /_launch/:code─────────────────────► session cookie
 browser (in frame)  ──GET /_launch/:code?format=json─────────► session ticket
+browser (no ticket) ──GET /_auth/start───────────────────────► platform handshake
+browser (no identity) ──GET /_auth/declined──────────────────► login or guest choice
 application backend ──GET /_gateway/me───────────────────────► viewer or guest
 ```
 
@@ -80,6 +82,38 @@ replace it, and the gateway checks the record's `app` against the requested
 application, so a cookie taken from one application cannot be replayed against
 another.
 
+## Identity on first load
+
+Opening an application URL directly is not a guest-only path. Every entry, from
+the sidebar or from a pasted link, follows the same three steps:
+
+```text
+1. credential present        -> enter with that identity
+2. no credential             -> GET /_auth/start, i.e. one automatic attempt
+                                to obtain an identity from CatsCompany
+3. attempt did not succeed   -> /_auth/declined offers
+                                [log in to CatsCompany] [continue as guest]
+```
+
+Step 2 is a plain top-level redirect to the platform handshake page, which lives
+on the platform origin where the user's existing login session is available; it
+returns a one-time code, and the existing `/_launch/:code` turns that code into a
+session. It is the same code mechanism the sidebar uses, not a second path, and
+it needs no third-party cookie access, no iframe and no browser fingerprinting.
+
+An application triggers it with two lines and marks the guest choice so the
+attempt is not repeated in a loop:
+
+```js
+const params = new URLSearchParams(location.search);
+if (params.get('identity') === 'guest') return;          // user chose guest
+const me = await fetch('/_gateway/me?app=my-app').then(r => r.json());
+if (!me.authenticated) location.replace('/_auth/start?app=my-app&next=' + encodeURIComponent(location.pathname));
+```
+
+`next` is restricted to paths inside the requesting application, so the endpoint
+cannot be used as an open redirect.
+
 ## In-frame entry
 
 Browsers block third-party cookies inside frames, so the sidebar path uses the
@@ -112,6 +146,7 @@ Environment for `deploy/control-plane.service` (`/etc/catsco-artifact-gateway/co
 | `CAG_CONTROL_TOKEN` | shared secret for `POST /_gateway/codes`; at least 32 chars |
 | `CAG_STATE_FILE` | viewer state, defaults to `/var/lib/catsco-artifact-gateway/viewer-state.json` |
 | `CAG_CORS_ORIGINS` | comma-separated origins allowed to read `/api/apps` |
+| `CAG_HANDSHAKE_URL` | platform handshake page for `/_auth/start`; defaults to `https://app.catsco.cc/artifact-auth`, can also come from `handshakeUrl` in `gateway.json` |
 | `CAG_CODE_TTL_SECONDS` / `CAG_SESSION_TTL_SECONDS` | 60 / 2592000 by default |
 | `CAG_COOKIE_INSECURE` | test only: drop `Secure` for plain-HTTP local runs |
 
