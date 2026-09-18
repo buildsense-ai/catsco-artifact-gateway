@@ -184,6 +184,46 @@ test('identity resolves the application from the referring path', async () => {
   });
 });
 
+test('an application is only listed for the bot that owns it', () => {
+  const owned = {
+    ...CONFIG,
+    apps: [
+      { ...CONFIG.apps[0], agent: '365' },
+      { ...CONFIG.apps[1], agent: '9308' },
+      { id: 'unowned', remotePort: 28193, publicKey: 'ssh-ed25519 AAAATEST3 unowned' },
+    ],
+  };
+  const ids = (agent) => buildAppList(owned, agent === undefined ? {} : { agent }).map(app => app.id);
+  assert.deepEqual(ids('365'), ['demo']);
+  assert.deepEqual(ids('9308'), ['other']);
+  assert.deepEqual(ids('999'), [], 'a bot with no registered application sees nothing');
+  assert.ok(!ids('365').includes('unowned'), 'an application with no declared owner belongs to no bot');
+  assert.deepEqual(ids(), ['demo', 'other', 'unowned'], 'an unscoped caller still sees the inventory');
+});
+
+test('the list endpoint scopes to the requested bot', async () => {
+  const store = new ViewerStore({ file: tmpState() });
+  const server = createControlPlane({
+    config: { ...CONFIG, apps: [{ ...CONFIG.apps[0], agent: '365' }, { ...CONFIG.apps[1], agent: '9308' }] },
+    store,
+    controlToken: CONTROL_TOKEN,
+    logger: { error() {} },
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const scoped = await (await fetch(`${base}/api/apps?agent=365`)).json();
+    assert.deepEqual(scoped.apps.map(app => app.id), ['demo']);
+    const empty = await (await fetch(`${base}/api/apps?agent=777`)).json();
+    assert.deepEqual(empty.apps, []);
+    const all = await (await fetch(`${base}/api/apps`)).json();
+    assert.equal(all.apps.length, 2);
+    assert.equal((await fetch(`${base}/api/apps?agent=bot`)).status, 400);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('gateway exposes the control plane and lets applications read their own cookie', () => {
   const r = renderGateway(CONFIG);
   assert.ok(r.locations.includes('location = /_gateway/tunnel'));

@@ -9,6 +9,19 @@ export function name(value) {
   if (typeof value !== 'string' || !/^[a-z][a-z0-9_-]{0,47}$/.test(value)) throw new Error('Invalid application/user name');
   return value;
 }
+// Owner of an application: the CatsCompany bot uid. A bot reads its own value
+// from CATSCOMPANY_BOT_UID and declares it when registering the application.
+export function botUid(value) {
+  const text = typeof value === 'number' ? String(value) : value;
+  if (typeof text !== 'string' || !/^[1-9][0-9]{0,18}$/.test(text)) throw new Error('Expected a positive bot uid');
+  return text;
+}
+export function appTitle(value) {
+  if (typeof value !== 'string') throw new Error('Invalid application title');
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 60 || /[\r\n\0]/.test(trimmed)) throw new Error('Invalid application title');
+  return trimmed;
+}
 export function validateConnector(c) {
   name(c.appId); name(c.user);
   if (typeof c.host !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(c.host)) throw new Error('Invalid gateway hostname');
@@ -17,6 +30,10 @@ export function validateConnector(c) {
     if (typeof c[k] !== 'string' || !path.isAbsolute(c[k]) || /[\r\n\0]/.test(c[k])) throw new Error(`Invalid ${k}`);
   }
   if (c.transportUrl && !/^wss:\/\/[a-zA-Z0-9.-]+(?::[0-9]+)?\/[a-zA-Z0-9/_-]+$/.test(c.transportUrl)) throw new Error('Invalid WSS transport URL');
+  // Optional so a connector generated before ownership was recorded keeps
+  // running; new registrations always record it.
+  if (c.agent !== undefined) botUid(c.agent);
+  if (c.title !== undefined) appTitle(c.title);
   return c;
 }
 export function sshArgs(input) {
