@@ -216,12 +216,13 @@ test('return paths stay inside the requesting application', () => {
   ]) assert.equal(safeNext(hostile, 'demo'), '/demo/', `must be rejected: ${hostile}`);
 });
 
-test('handshake target carries the application and the return path', () => {
-  const target = new URL(handshakeTarget('https://app.example.cc/artifact-auth', 'demo', '/demo/page.html'));
+test('handshake target carries the application, the return path and the gateway origin', () => {
+  const target = new URL(handshakeTarget('https://app.example.cc/artifact-auth', 'demo', '/demo/page.html', 'https://artifact.example.cn'));
   assert.equal(target.origin, 'https://app.example.cc');
   assert.equal(target.pathname, '/artifact-auth');
   assert.equal(target.searchParams.get('app'), 'demo');
   assert.equal(target.searchParams.get('next'), '/demo/page.html');
+  assert.equal(target.searchParams.get('gw'), 'https://artifact.example.cn');
 });
 
 test('an application without a credential is sent to the platform handshake', async () => {

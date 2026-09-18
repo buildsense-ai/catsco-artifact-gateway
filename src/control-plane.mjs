@@ -94,11 +94,19 @@ export function safeNext(value, app) {
   return value;
 }
 
-export function handshakeTarget(handshakeUrl, app, next) {
+export function handshakeTarget(handshakeUrl, app, next, gatewayOrigin) {
   const target = new URL(handshakeUrl);
   target.searchParams.set('app', app);
   target.searchParams.set('next', next);
+  target.searchParams.set('gw', gatewayOrigin);
   return target.toString();
+}
+
+// The host the browser actually used, so the handshake returns the visitor to
+// the same domain instead of always the first configured one.
+function gatewayOrigin(req, hosts) {
+  const host = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
+  return `https://${hosts.includes(host) ? host : hosts[0]}`;
 }
 
 function choicePage(app, next) {
@@ -231,7 +239,7 @@ export function createControlPlane({ config, store, controlToken, corsOrigins = 
         const app = appId(url.searchParams.get('app') || '');
         if (!known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const next = safeNext(url.searchParams.get('next'), app);
-        res.writeHead(302, { Location: handshakeTarget(handshakeUrl, app, next), 'Cache-Control': 'no-store' });
+        res.writeHead(302, { Location: handshakeTarget(handshakeUrl, app, next, gatewayOrigin(req, hosts)), 'Cache-Control': 'no-store' });
         return res.end();
       }
 
