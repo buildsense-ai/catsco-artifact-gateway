@@ -21,13 +21,18 @@ export function renderGateway(c) {
     keys.add(key);
   }
   // Control plane routes are shared by every application, so they are rendered
-  // once instead of per application.
-  const control = controlPort === null ? '' : `location = /api/apps { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=20 nodelay; limit_conn cag_p0_connections 20; }
-location = /_gateway/health { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
-location = /_gateway/me { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie $http_cookie; proxy_set_header Authorization $http_authorization; proxy_buffering off; limit_req zone=cag_p0_requests burst=20 nodelay; limit_conn cag_p0_connections 20; }
-location = /_gateway/codes { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
-location ^~ /_auth/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
-location ^~ /_launch/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Cookie ""; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
+  // once instead of per application. They forward the browser's own Host: the
+  // control plane picks a public domain and a handshake page by suffix, and
+  // without this nginx would send `127.0.0.1:<controlPort>` instead, leaving the
+  // lookup with nothing to match and silently falling back to the first domain —
+  // so a `.cn` visitor would be sent to the `.cc` login page, which is exactly
+  // the cross-site hop this is meant to avoid.
+  const control = controlPort === null ? '' : `location = /api/apps { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Host $host; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=20 nodelay; limit_conn cag_p0_connections 20; }
+location = /_gateway/health { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Host $host; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
+location = /_gateway/me { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Host $host; proxy_set_header Cookie $http_cookie; proxy_set_header Authorization $http_authorization; proxy_buffering off; limit_req zone=cag_p0_requests burst=20 nodelay; limit_conn cag_p0_connections 20; }
+location = /_gateway/codes { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Host $host; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
+location ^~ /_auth/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Host $host; proxy_set_header Cookie ""; proxy_hide_header Set-Cookie; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
+location ^~ /_launch/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_header Host $host; proxy_set_header Cookie ""; proxy_buffering off; limit_req zone=cag_p0_requests burst=10 nodelay; }
 `;
   return {
     sshd: `Port ${c.sshPort}\nListenAddress 127.0.0.1\nHostKey ${c.hostKey}\nPidFile /run/catsco-artifact-gateway.pid\nAuthorizedKeysFile ${c.authorizedKeys}\nAllowUsers ${c.user}\nPubkeyAuthentication yes\nAuthenticationMethods publickey\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nUsePAM yes\nAllowTcpForwarding remote\nAllowStreamLocalForwarding no\nGatewayPorts no\nPermitListen ${c.apps.map(a => `127.0.0.1:${a.remotePort}`).join(' ')}\nPermitOpen none\nAllowAgentForwarding no\nX11Forwarding no\nPermitTunnel no\nPermitTTY no\nPermitUserEnvironment no\nMaxSessions 0\nMaxAuthTries 3\nMaxStartups 10:30:30\nLoginGraceTime 20\nClientAliveInterval 15\nClientAliveCountMax 2\nLogLevel VERBOSE\n`,
