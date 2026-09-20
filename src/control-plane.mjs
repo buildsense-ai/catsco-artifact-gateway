@@ -494,7 +494,11 @@ export function createControlPlane({
       title: text(body.title) ?? previous?.title ?? id,
       agent,
       remotePort,
-      publicKey: text(body.publicKey),
+      // Same rule as the title: an update that does not name a key keeps the one
+      // already registered. The caller cannot read that key back, so requiring it
+      // would turn every rename into a key rotation — and a rotation breaks the
+      // connector that is already connected.
+      publicKey: text(body.publicKey) ?? previous?.publicKey,
     };
     // Same rule as the title: an update that does not send a local port keeps
     // the recorded one, so rotating a key cannot erase what the connector was
