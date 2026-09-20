@@ -28,7 +28,15 @@ NODE=/usr/local/bin/node
 
 TMP=$(mktemp -d /run/cag-apply.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
-"$NODE" "$RENDER" "$CONF/gateway.json" "$TMP"
+# The control plane owns gateway.json but not this directory, so it rewrites that
+# file in place rather than via a temporary file and rename. A watcher can
+# therefore occasionally observe a partial document. Rendering is cheap and the
+# second attempt almost always succeeds, so retry once instead of failing an
+# apply that would otherwise have been fine.
+"$NODE" "$RENDER" "$CONF/gateway.json" "$TMP" 2>/dev/null || {
+  sleep 1
+  "$NODE" "$RENDER" "$CONF/gateway.json" "$TMP"
+}
 
 # Install only what changed, keeping one .bak per file. Nothing changed means no
 # reload and no restart, which is also what makes a duplicate trigger harmless.
