@@ -5,7 +5,7 @@
 // a ticket; they forward the credential to `/_gateway/me` and read the result.
 import http from 'node:http';
 import fs from 'node:fs';
-import { appId, COOKIE_NAME, isToken, ViewerStore, VIEWER_CONTRACT } from './viewer-store.mjs';
+import { appId, COOKIE_NAME, isToken, ViewerStore, VIEWER_CONTRACT, viewerIdentity } from './viewer-store.mjs';
 import { cookieName, httpsUrl } from './config.mjs';
 
 // Default platform handshake page. It must be the file the platform actually
@@ -128,9 +128,16 @@ async function verifyPlatformIdentity({ url, name, value, controlToken, timeoutM
     if (res.status !== 200) return null;
     const body = await res.json();
     if (!body || body.authenticated !== true) return null;
+    // The platform is the authority on its own uid, so this is the boundary
+    // that insists on the shape: anything a real platform would never send is a
+    // refusal (and therefore a guest), not a subject we quietly mint from.
     const uid = typeof body.uid === 'number' ? String(body.uid) : body.uid;
-    if (typeof uid !== 'string' || uid === '') return null;
-    return { uid, expiresAt: typeof body.expires_at === 'string' ? body.expires_at : null };
+    if (typeof uid !== 'string' || !/^[0-9]{1,19}$/.test(uid)) return null;
+    return {
+      uid,
+      username: typeof body.username === 'string' && body.username ? body.username : null,
+      expiresAt: typeof body.expires_at === 'string' ? body.expires_at : null,
+    };
   } catch (error) {
     // Deliberately no error.message: a transport error can quote the request
     // headers, and one of them is the visitor's platform cookie.
@@ -160,11 +167,54 @@ export function handshakeTarget(handshakeUrl, app, next, gatewayOrigin) {
   return target.toString();
 }
 
+// How many trailing labels two hostnames share. `app.catsco.cn` and
+// `artifact.catsco.cn` share two, which is the smallest useful match: it ties a
+// platform origin to its gateway origin without treating every `.com` host as
+// related. Anything shorter would make unrelated sites look like one site, and a
+// shared site is exactly what keeps the visitor's cookies working.
+function sharedTail(a, b) {
+  const left = a.split('.').reverse();
+  const right = b.split('.').reverse();
+  let shared = 0;
+  while (shared < left.length && shared < right.length && left[shared] === right[shared]) shared += 1;
+  return shared;
+}
+
+function hostOf(value) {
+  if (typeof value !== 'string' || !value) return '';
+  const text = value.includes('://') ? (() => { try { return new URL(value).hostname; } catch { return ''; } })() : value;
+  const host = text.trim().toLowerCase().split(':')[0];
+  if (!/^[a-z0-9.-]{1,253}$/.test(host) || host.startsWith('.') || host.endsWith('.') || host.includes('..')) return '';
+  return host;
+}
+
+// Pick the entry that shares the caller's site, so the browser stays on the
+// domain it is already signed in to. The two domains are the same deployment, so
+// a wrong but reachable choice does not fail loudly — it silently drops the
+// visitor to a guest. That is why the fallback only ever covers a hint that
+// matches nothing (an older platform, or a deployment with one host configured);
+// it is never a first choice.
+export function matchBySuffix(entries, hint, hostOfEntry = hostOf) {
+  const list = (Array.isArray(entries) ? entries : []).filter(entry => typeof entry === 'string' && entry);
+  if (list.length === 0) return null;
+  const wanted = hostOf(hint);
+  if (!wanted) return list[0];
+  let best = null;
+  for (const entry of list) {
+    const host = hostOfEntry(entry);
+    if (!host) continue;
+    if (host === wanted) return entry;
+    const shared = sharedTail(wanted, host);
+    if (shared >= 2 && (!best || shared > best.shared)) best = { entry, shared };
+  }
+  return best ? best.entry : list[0];
+}
+
 // The host the browser actually used, so the handshake returns the visitor to
-// the same domain instead of always the first configured one.
+// the same domain instead of always the first configured one. The answer is
+// always an entry of `hosts`: the request header must never be echoed back.
 function gatewayOrigin(req, hosts) {
-  const host = typeof req.headers.host === 'string' ? req.headers.host.trim().toLowerCase() : '';
-  return `https://${hosts.includes(host) ? host : hosts[0]}`;
+  return `https://${matchBySuffix(hosts, req.headers.host)}`;
 }
 
 function choicePage(app, next) {
@@ -217,6 +267,7 @@ export function createControlPlane({
   configUpdatedAt = null,
   logger = console,
   handshakeUrl = DEFAULT_HANDSHAKE_URL,
+  handshakeUrls = null,
   platformIdentityUrl = PLATFORM_IDENTITY_URL,
   platformCookieName = PLATFORM_COOKIE_NAME,
   platformIdentityTimeoutMs = PLATFORM_TIMEOUT_MS,
@@ -224,12 +275,23 @@ export function createControlPlane({
 }) {
   if (!controlToken || controlToken.length < 32) throw new Error('Control token must be at least 32 characters');
   if (!store) throw new Error('Viewer store is required');
-  httpsUrl(handshakeUrl, 'handshake URL');
+  const hosts = [...config.publicHosts];
+  // Without a host there is no public URL to hand back, and the empty string
+  // would silently produce `https://undefined/...` in a launch response.
+  if (hosts.length === 0) throw new Error('At least one public host is required');
+  // One handshake page per public domain, picked by the same suffix rule as the
+  // launch URL: a visitor on `.cn` must be sent to the `.cn` login, not to the
+  // other domain where they may not be signed in. Every configured entry is
+  // validated here, because a typo in one of them would otherwise only surface
+  // as a broken login on one of the two domains.
+  if (handshakeUrls !== null && handshakeUrls !== undefined && !Array.isArray(handshakeUrls)) throw new Error('Handshake URLs must be a list');
+  const handshakeList = Array.isArray(handshakeUrls) ? [...handshakeUrls] : [];
+  if (handshakeList.length === 0) handshakeList.push(handshakeUrl);
+  for (const candidate of handshakeList) httpsUrl(candidate, 'handshake URL');
   // An empty URL switches the platform relay off: the gateway then behaves
   // exactly as it did before the path existed.
   const platformUrl = platformIdentityUrl ? httpsUrl(platformIdentityUrl, 'platform identity URL') : null;
   const platformName = cookieName(platformCookieName);
-  const hosts = [...config.publicHosts];
   const known = new Set((config.apps || []).map(app => app.id));
 
   // The silent path: a platform-signed visitor becomes a user record, with the
@@ -254,7 +316,7 @@ export function createControlPlane({
     return {
       contract: VIEWER_CONTRACT,
       authenticated: true,
-      viewer: { id, kind: 'user' },
+      viewer: viewerIdentity(id, identity.uid, identity.username),
       app_id: app,
       topic_id: null,
       expires_at: identity.expiresAt,
@@ -303,12 +365,17 @@ export function createControlPlane({
         const body = JSON.parse((await readBody(req)) || '{}');
         const app = appId(body.app);
         if (!known.has(app)) return json(res, 404, { error: 'unknown_app' });
-        const { code, expiresAt } = store.issueCode({ app, uid: body.uid, topic: body.topic ?? null });
+        const { code, expiresAt } = store.issueCode({ app, uid: body.uid, username: body.username, topic: body.topic ?? null });
+        // The caller says which of our public domains its user is signed in to.
+        // That is only a hint: it is matched against the configured list, so an
+        // unknown value degrades to the default host instead of pointing the
+        // browser at an attacker-chosen one.
+        const host = matchBySuffix(hosts, body.host);
         return json(res, 201, {
           app_id: app,
           code,
           expires_at: expiresAt,
-          launch_url: `https://${hosts[0]}/_launch/${code}?next=/${app}/`,
+          launch_url: `https://${host}/_launch/${code}?next=/${app}/`,
         });
       }
 
@@ -345,7 +412,8 @@ export function createControlPlane({
         const app = appId(url.searchParams.get('app') || '');
         if (!known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const next = safeNext(url.searchParams.get('next'), app);
-        res.writeHead(302, { Location: handshakeTarget(handshakeUrl, app, next, gatewayOrigin(req, hosts)), 'Cache-Control': 'no-store' });
+        const handshake = matchBySuffix(handshakeList, req.headers.host);
+        res.writeHead(302, { Location: handshakeTarget(handshake, app, next, gatewayOrigin(req, hosts)), 'Cache-Control': 'no-store' });
         return res.end();
       }
 
@@ -421,6 +489,7 @@ export function loadControlPlaneFromEnv({ configPath, env = process.env, logger 
       cookieSecure: env.CAG_COOKIE_INSECURE !== '1',
       configUpdatedAt,
       handshakeUrl: env.CAG_HANDSHAKE_URL || config.handshakeUrl || undefined,
+      handshakeUrls: config.handshakeUrls,
       platformIdentityUrl: env.CAG_PLATFORM_IDENTITY_URL ?? PLATFORM_IDENTITY_URL,
       platformCookieName: env.CAG_PLATFORM_COOKIE_NAME || PLATFORM_COOKIE_NAME,
       logger,

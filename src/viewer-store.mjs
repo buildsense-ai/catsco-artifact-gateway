@@ -52,6 +52,45 @@ export function pseudonym(secret, app, uid) {
   return 'ap_' + crypto.createHmac('sha256', secret).update(`${app}\u0000${value}`).digest('base64url').slice(0, 22);
 }
 
+// The platform uid as it travels into the gateway. It is an identifier, never a
+// credential. This layer keeps it an opaque bounded string on purpose: what the
+// store mints from a subject is what the contract pins, not its spelling, and
+// the one place that must insist on digits is the platform response itself.
+export function uidRef(value) {
+  const text = typeof value === 'number' ? String(value) : value;
+  if (typeof text !== 'string' || text === '' || text.length > 128 || /[\r\n\0]/.test(text)) throw new Error('Invalid uid');
+  return text;
+}
+
+// The same value as the number the contract publishes. Only a plain digit run
+// becomes a number; anything else publishes null rather than a rounded or
+// invented value. A uid beyond the safe integer range reports null too, because
+// it would already have lost precision in the platform's own JSON.
+export function uidNumber(value) {
+  const text = typeof value === 'number' ? String(value) : value;
+  if (typeof text !== 'string' || !/^[0-9]{1,19}$/.test(text)) return null;
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+// The readable account name, so an application can anchor its own rows to a
+// platform account. Optional on purpose: it is additive to the contract, so a
+// platform release that does not send it yet keeps working and reports null.
+// Never trimmed or case-folded — this is an anchor, not a label.
+export function usernameRef(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string' || value.length > 64 || /[\r\n\0]/.test(value)) throw new Error('Invalid username');
+  return value;
+}
+
+// The single application-facing identity shape, shared by both entry paths so
+// the one-shot code and the silent platform cookie cannot disagree about a
+// user. `id` stays the pseudonym: applications already store it as their local
+// key, so removing it would orphan what they already wrote down.
+export function viewerIdentity(sub, uid, username) {
+  return { id: sub, uid: uidNumber(uid), username: usernameRef(username), kind: 'user' };
+}
+
 export class ViewerStore {
   constructor({ file, secret, codeTtlSeconds = 60, sessionTtlSeconds = 2592000, now = () => Date.now() }) {
     if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error('Viewer state file must be an absolute path');
@@ -76,13 +115,17 @@ export class ViewerStore {
     return pseudonym(this.secret, app, uid);
   }
 
-  // Issue a one-time code bound to (app, subject, topic).
-  issueCode({ app, uid, topic = null }) {
+  // Issue a one-time code bound to (app, subject, topic). The platform uid and
+  // account name ride along so the redeemed session can answer with the same
+  // identity the silent path produces.
+  issueCode({ app, uid, username = null, topic = null }) {
     appId(app);
     const record = {
       kind: 'code',
       app,
       sub: this.pseudonymFor(app, uid),
+      uid: uidRef(uid),
+      username: usernameRef(username),
       topic: topicRef(topic),
       exp: this.now() + this.codeTtlSeconds * 1000,
       used: false,
@@ -108,6 +151,8 @@ export class ViewerStore {
       kind: 'session',
       app: record.app,
       sub: record.sub,
+      uid: record.uid ?? null,
+      username: record.username ?? null,
       topic: record.topic,
       exp: this.now() + this.sessionTtlSeconds * 1000,
       used: false,
@@ -149,7 +194,7 @@ export class ViewerStore {
     return {
       contract: VIEWER_CONTRACT,
       authenticated: true,
-      viewer: { id: record.sub, kind: 'user' },
+      viewer: viewerIdentity(record.sub, record.uid, record.username),
       app_id: record.app,
       topic_id: record.topic,
       expires_at: new Date(record.exp).toISOString(),
