@@ -393,10 +393,13 @@ export function createControlPlane({
   // registration is never the step that widens it.
   function writeConfig(next) {
     const mode = (() => { try { return fs.statSync(configPath).mode & 0o777; } catch { return 0o600; } })();
-    const tmp = `${configPath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { mode });
-    fs.chmodSync(tmp, mode);
-    fs.renameSync(tmp, configPath);
+    // Written in place. The file belongs to this service, but the directory
+    // holding it is root-owned and not writable here, so the usual tmp+rename
+    // would fail with EACCES on the temporary file — the service would be unable
+    // to save a registration it had already accepted. The document is a few
+    // kilobytes and is rewritten whole, and the watcher that consumes it retries
+    // rather than acting on a partial read.
+    fs.writeFileSync(configPath, JSON.stringify(next, null, 2) + '\n', { mode });
   }
 
   // `updated_at` is the config file's own timestamp, read after the write so it
