@@ -467,6 +467,15 @@ export function createControlPlane({
     const current = currentConfig();
     const apps = Array.isArray(current.config.apps) ? current.config.apps : [];
     const previous = apps.find(app => app.id === id);
+    // Registering an existing id replaces that entry, and the owner recorded here
+    // is what decides whose sidebar the application appears in. The platform
+    // proves ownership before it calls, but this is the last line of defence: a
+    // caller that forgot would otherwise move another account's application —
+    // and the port its connector is forwarding — onto itself.
+    const agent = String(body.agent).trim();
+    if (previous && String(previous.agent ?? '') !== agent) {
+      return json(res, 409, { error: 'agent_mismatch' });
+    }
     // An update keeps the port the running connector was told to forward:
     // moving it would break a tunnel that is already up.
     const remotePort = previous
@@ -480,7 +489,7 @@ export function createControlPlane({
       // An update without a title keeps the one already published, so a caller
       // that only sends the key cannot silently rename somebody's sidebar entry.
       title: text(body.title) ?? previous?.title ?? id,
-      agent: String(body.agent).trim(),
+      agent,
       remotePort,
       publicKey: text(body.publicKey),
     };

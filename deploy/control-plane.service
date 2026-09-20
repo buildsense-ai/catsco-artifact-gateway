@@ -16,6 +16,10 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 StateDirectory=catsco-artifact-gateway
+# ProtectSystem=strict mounts /etc read-only, so the registration API would fail
+# with EROFS the moment it writes gateway.json. This is the one path the control
+# plane is meant to own; everything else under /etc stays read-only.
+ReadWritePaths=/etc/catsco-artifact-gateway
 MemoryMax=128M
 TasksMax=32
 LimitNOFILE=1024

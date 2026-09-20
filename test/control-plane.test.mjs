@@ -811,6 +811,38 @@ test('re-registering an application keeps its remote port and its title', async 
   }, config);
 });
 
+test('an application cannot be taken over by re-registering its id', async () => {
+  // An update replaces the entry by id, so a caller that skipped its own
+  // ownership check could otherwise move another account's application — and the
+  // public key, and the port its connector forwards — onto itself.
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const mine = await apps(base, { method: 'POST', body: registration({ id: 'taken', agent: '365', publicKey: 'ssh-ed25519 AAAAOWNER taken' }) });
+    assert.equal(mine.status, 201);
+
+    const stolen = await apps(base, { method: 'POST', body: registration({ id: 'taken', agent: '999', publicKey: 'ssh-ed25519 AAAATHIEF taken' }) });
+    assert.equal(stolen.status, 409);
+    assert.equal(stolen.body.error, 'agent_mismatch');
+
+    // An application that declares no owner is not up for grabs either.
+    const orphan = await apps(base, { method: 'POST', body: registration({ id: 'other', agent: '999', publicKey: 'ssh-ed25519 AAAAORPHAN other' }) });
+    assert.equal(orphan.status, 409);
+
+    // Untouched: same owner, same key, same port.
+    const stored = config.read().apps.filter(app => app.id === 'taken');
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].agent, '365');
+    assert.equal(stored[0].publicKey, 'ssh-ed25519 AAAAOWNER taken');
+    assert.equal(stored[0].remotePort, mine.body.remote_port);
+
+    // The owner can still update, and still keeps the port.
+    const again = await apps(base, { method: 'POST', body: registration({ id: 'taken', agent: '365', publicKey: 'ssh-ed25519 AAAAROTATED taken' }) });
+    assert.equal(again.status, 201);
+    assert.equal(again.body.status, 'updated');
+    assert.equal(again.body.remote_port, mine.body.remote_port);
+  }, config);
+});
+
 test('a new application is visible to every route at once', async () => {
   const config = registrationConfig();
   await withServer(async ({ base }) => {
