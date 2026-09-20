@@ -1,0 +1,18 @@
+# Watches the one file the control plane is allowed to write.
+#
+# Chosen over giving cag_ingress sudo: the root component here reacts to a file
+# that only that unprivileged service can write, so its attack surface equals
+# today's scripts/register-app.mjs. No sudoers entry, no second daemon.
+#
+# src/control-plane.mjs replaces gateway.json with tmp + rename, i.e. the watcher
+# only ever observes a complete file; a duplicate or spurious trigger is harmless
+# because apply-config.sh installs nothing when the rendered content is equal.
+[Unit]
+Description=Watch the Artifact gateway config for control-plane writes
+
+[Path]
+PathModified=/etc/catsco-artifact-gateway/gateway.json
+Unit=cag-apply.service
+
+[Install]
+WantedBy=paths.target

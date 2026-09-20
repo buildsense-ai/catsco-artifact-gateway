@@ -21,6 +21,20 @@ P0 服务使用内存、CPU、任务数上限；OpenSSH 按密钥 permitlisten �
 
 最初尝试新增公网端口遇到外层网络阻挡，现已撤回相应 UFW 放行规则，最终只走已有 443。那些端口不是完成方案的依赖。
 
+## 自动应用配置（一次性安装）
+
+发布应用只改 `gateway.json`（`cag_ingress` 拥有，0600），而它驱动的四个文件都是 `/etc` 下的 root 文件。所以配置生效交给一个 root oneshot，一次性安装：
+
+```sh
+install -m 755 deploy/apply-config.sh /opt/catsco-artifact-gateway/deploy/apply-config.sh
+install -m 644 deploy/cag-apply.service deploy/cag-apply.path /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now cag-apply.path
+```
+
+`cag-apply.path` 监听 `gateway.json` 变化 → `cag-apply.service` 渲染四个文件：`nginx -t` 通过才 reload nginx，`sshd -t` 通过才 restart `catsco-artifact-gateway-p0`。不通过就不动正在跑的服务，因此不需要回滚框架。`cag_ingress` 仍然没有 sudo，root 侧只对一个「本来就只有它可写」的文件做出反应，攻击面等于原来的 `scripts/register-app.mjs`。
+
+文件名与实际路径映射（2026-09-20 在 catsco-prod 只读确认）：`sshd`→`/etc/catsco-artifact-gateway/sshd`、`authorizedKeys`→`/etc/catsco-artifact-gateway/authorized_keys`、`locations`→`/etc/catsco-artifact-gateway/artifact-locations.conf`、`nginx`→`/etc/nginx/conf.d/catsco-artifact-gateway-p0.conf`。
+
 ## 回滚（保留数据）
 
 1. 停止两端的演示应用/连接器，只针对上述测试进程；不要停止 XiaoBa。

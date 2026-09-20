@@ -49,12 +49,15 @@ const me = await fetch('https://artifact.catsco.cc/_gateway/me?app=<你的应用
     authorization: req.headers.authorization || '',   // 页内/兜底时
   },
 }).then(r => r.json());
-// me = { contract, authenticated, viewer:{id,kind}, app_id, topic_id, expires_at }
+// me = { contract, authenticated, viewer:{id,uid,username,kind}, app_id, topic_id, expires_at }
 ```
 
 - `me.viewer.id`（形如 `ap_xxx`）是**按应用派生的稳定伪名**：同一个用户在你的应用里永远是同一个值，在别的应用里对不上。可以直接当本地 ACL 的主键。
+- `me.viewer.uid` / `me.viewer.username` 是**平台侧标识**（数字 uid / 平台账号名）。要用它们就注意：这是**跨应用可关联**的，用 `viewer.id` 则不会。
 - `me.topic_id` 是用户从哪个会话进来的（侧栏进入时有，直接开网址时为 `null`）。
 - 访客是 `authenticated: false, viewer: null`。权限策略完全由你在本地决定。
+
+**身份是用来做差异化展示和权限的，不是只拿来显示的**——完整示例（按身份分支渲染、ACL 存本地）见 [ARTIFACT-API.md](ARTIFACT-API.md) 第 5 节。三条要点：判定放**后端**（前端可被改）、未知身份**降级**而不是当管理员、网关卡顿返回的是**游客**（不要把故障当成"没权限"）。
 
 自动握手（第 2 步）应用侧照抄这两行即可：
 
@@ -70,8 +73,6 @@ if (me && me.authenticated === false && window.top === window) {   // 只在顶�
 在 iframe 里不要发起握手（会把平台页塞进小框）；框里没有凭据时提示用户用「新页面打开」即可。
 
 参考实现：`demo/server.mjs` 的 `/api/whoami`（转发凭据）+ 首页脚本（顶层握手）。
-
-> **页面里的请求一律用相对路径。** 应用被服务在 `/<app-id>/` 下，所以页面里要写 `fetch('api/whoami')` 而不是 `fetch('/api/whoami')`：带前导斜杠会解析成网关根路径，既打到别处、也不在页面 CSP 的 `connect-src .../<app-id>/` 允许范围内（浏览器表现为 `Failed to fetch`）。跳转到 `/_auth/start`、`/_launch/:code` 这类**网关控制面**地址时才用带斜杠的绝对路径。
 
 ## 5. 发布四步
 
@@ -92,17 +93,20 @@ node src/connector.mjs <你的状态目录>/connector.json
 
 ### 接口对照
 
+**发布/查询/下架走平台**（用你自己的凭据，不需要网关权限）；**取身份由应用后端直接问网关**。
+
 | 接口 | 谁用 | 用途 |
 |---|---|---|
-| `--agent` / `registration.json` | 你（init） | 声明应用归属 |
-| `register-app.mjs <gw.json> <reg.json>` | 平台 | 登记一个应用（校验端口/密钥唯一、schema 合法） |
-| `register-app.mjs <gw.json> --list` | 平台 | **查看每个应用归属哪个 bot**，未标注的会告警 |
-| `register-app.mjs <gw.json> --remove <id>` | 平台 | 下架 |
-| `GET /api/apps?agent=<uid>` | 侧栏 | 取**该 bot 的**应用清单（5 字段：id/title/url/status/updated_at） |
-| `POST /_gateway/codes` | 平台（控制 token） | 发一次性码 |
+| `POST /api/artifacts/apps` | 你（发布者） | **发布/更新**一个应用。归属强制取调用者，远端端口由网关分配 |
+| `GET /api/artifacts/apps` | 你 | 列出**自己**的应用（含公开地址） |
+| `DELETE /api/artifacts/apps/<id>` | 你 | 下架自己的应用 |
+| `GET /_gateway/me?app=<id>` | **你的应用后端** | 取访问者身份 + 来源会话（权限/差异化展示的输入） |
+| `GET /api/apps?agent=<uid>` | 侧栏 | 取**该 bot 的**应用清单（id/title/url/status/updated_at） |
+| `POST /_gateway/codes` | 平台（共享令牌） | 发一次性码 |
 | `GET /_launch/:code` | 浏览器 | 兑码 → 会话 Cookie（或 `?format=json` 取 ticket） |
-| `GET /_gateway/me` | 你的应用 | 身份 + topic |
 | `GET /_auth/start` · `/_auth/declined` | 浏览器 | 自动握手 · 登录/访客选择 |
+
+完整契约（请求/响应字段、错误码、权限示例、验证步骤）见 **[ARTIFACT-API.md](ARTIFACT-API.md)**。远端端口由网关分配这件事会让连接器配置分两步完成，具体命令以 `scripts/init-connector.mjs` 的 `--help` 输出为准。
 
 ## 6. 归属如何隔离
 
