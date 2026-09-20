@@ -252,6 +252,15 @@ test('gateway exposes the control plane and lets applications read their own coo
   assert.ok(!appBlock.includes('proxy_set_header Cookie ""'), 'application path must receive the viewer cookie');
   assert.ok(!appBlock.includes('proxy_hide_header Set-Cookie'), 'application path may set its own cookies');
   assert.ok(r.locations.includes('proxy_set_header Cookie ""'), 'tunnel and control-plane ingress still strip cookies');
+  // The control plane picks a public domain and a handshake page by the request
+  // Host. Without the forward, nginx sends its own upstream address and every
+  // lookup silently falls back to the first domain, so a `.cn` visitor would be
+  // sent to the `.cc` login page.
+  const controlBlock = r.locations.split('location ^~ /demo/')[0];
+  const toControl = controlBlock.match(/proxy_pass http:\/\/127\.0\.0\.1:22445;/g) || [];
+  const forwarded = controlBlock.match(/proxy_pass http:\/\/127\.0\.0\.1:22445; proxy_set_header Host \$host;/g) || [];
+  assert.equal(toControl.length, 6, 'expected the six shared control routes');
+  assert.equal(forwarded.length, toControl.length, 'every control route must forward the browser Host');
   assert.ok(!renderGateway({ ...CONFIG, controlPort: undefined }).locations.includes('/_gateway/me'), 'control routes are optional');
   for (const controlPort of [80, '22445', 0]) assert.throws(() => renderGateway({ ...CONFIG, controlPort }));
   assert.throws(() => renderGateway({ ...CONFIG, controlPort: 28191 }), 'control port must not collide with an application');
