@@ -37,7 +37,7 @@ small{display:block;color:#607465}
   <p id="identity-detail"></p>
   <p>
     <button id="identity-refresh">重新获取身份</button>
-    <button id="identity-confirm" hidden>去确认身份</button>
+    <button id="identity-confirm" hidden>获取我的身份</button>
     <a id="identity-guest" hidden href="?identity=guest">以访客身份继续</a>
   </p>
 </section>
@@ -53,13 +53,13 @@ function el(id){ return document.getElementById(id); }
 function setIdentity(state, detail){ el('identity-state').textContent = state; el('identity-detail').textContent = detail || ''; }
 function show(id, on){ el(id).hidden = !on; }
 function startHandshake(){ location.replace('/_auth/start?app=' + encodeURIComponent(APP_ID) + '&next=' + encodeURIComponent(location.pathname)); }
-async function loadIdentity(auto){
+async function loadIdentity(){
   setIdentity('检测中…', '正在查询网关 /_gateway/me');
   try {
     // Relative on purpose: the application is served under /<app-id>/, so an
     // absolute '/api/...' would leave the application and hit the gateway root.
     var me = await (await fetch('api/whoami', { cache: 'no-store' })).json();
-    if (!me) { setIdentity('未检测到身份', '网关没有返回内容'); return; }
+    if (!me) { setIdentity('未检测到身份', '网关没有返回内容'); show('identity-confirm', true); return; }
     if (me.authenticated) {
       setIdentity('已确认身份' + (framed ? '（侧栏内）' : ''), '');
       el('identity-detail').textContent = '使用者 ' + me.viewer.id + '（' + me.viewer.kind + '） · 应用 ' + me.app_id
@@ -67,20 +67,17 @@ async function loadIdentity(auto){
         + ' · 有效期至 ' + me.expires_at;
       show('identity-guest', false); show('identity-confirm', false); return;
     }
-    if (framed) {
-      setIdentity('访客（侧栏内）', '在侧栏内无法发起身份确认，请用应用列表里的「新页面打开」');
-      show('identity-guest', false); show('identity-confirm', false); return;
-    }
     if (new URLSearchParams(location.search).get('identity') === 'guest') {
-      setIdentity('访客（你选择了以访客继续）', '需要身份时点「去确认身份」');
+      setIdentity('访客（你选择了以访客继续）', '需要身份时点「获取我的身份」');
       show('identity-guest', false); show('identity-confirm', true); return;
     }
-    setIdentity('未检测到身份', '正在自动前往平台确认身份…');
-    show('identity-guest', false); show('identity-confirm', false);
-    if (auto) startHandshake();
+    // No credential and no explicit choice. Stay on this page: identity is
+    // optional, so leaving the page is the visitor's decision, not ours.
+    setIdentity('访客（未检测到身份）', '已停在本页，不跳转。需要身份就点「获取我的身份」。');
+    show('identity-guest', true); show('identity-confirm', true);
   } catch (e) { setIdentity('无法获取身份', String((e && e.message) || e)); }
 }
-el('identity-refresh').onclick = function(){ loadIdentity(true); };
+el('identity-refresh').onclick = function(){ loadIdentity(); };
 el('identity-confirm').onclick = startHandshake;
 async function update(increment){
   try {
@@ -94,7 +91,7 @@ update(false);
 var stream = new EventSource('events');
 stream.onmessage = function(e){ el('stream').textContent = '实时事件流正常 · ' + JSON.parse(e.data).tick; };
 stream.onerror = function(){ el('stream').textContent = '事件流断开，等待恢复'; };
-loadIdentity(true);
+loadIdentity();
 </script></html>`;
 
 const server = http.createServer(async (req, res) => {
