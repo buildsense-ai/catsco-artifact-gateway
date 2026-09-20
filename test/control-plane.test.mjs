@@ -28,21 +28,30 @@ function tmpState() {
 }
 
 async function withServer(fn, options = {}) {
-  const store = new ViewerStore({ file: tmpState(), ...options });
+  // The options are read key by key instead of being spread: the registration
+  // tests hand over a helper object that also carries `file` (the gateway config
+  // they assert on), and a spread would make the viewer store write its state
+  // into that very file.
+  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl } = options;
+  const store = new ViewerStore({ file: tmpState() });
   const server = createControlPlane({
-    config: CONFIG,
+    config: config || CONFIG,
     store,
     controlToken: CONTROL_TOKEN,
     cookieSecure: false,
     corsOrigins: ['https://app.example.cc'],
-    handshakeUrl: options.handshakeUrl,
-    handshakeUrls: options.handshakeUrls,
-    platformIdentityUrl: options.platformIdentityUrl,
-    platformCookieName: options.platformCookieName,
-    platformIdentityTimeoutMs: options.platformIdentityTimeoutMs,
+    configPath,
+    transportUrl,
+    remotePortBase,
+    remotePortCeiling,
+    handshakeUrl,
+    handshakeUrls,
+    platformIdentityUrl,
+    platformCookieName,
+    platformIdentityTimeoutMs,
     // Default to a fetcher that refuses, so no test can silently reach the real
     // platform; the platform tests inject a loopback one.
-    fetchImpl: options.fetchImpl || (() => { throw new Error('unexpected platform call'); }),
+    fetchImpl: fetchImpl || (() => { throw new Error('unexpected platform call'); }),
     logger: { error() {} },
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -245,6 +254,9 @@ test('gateway exposes the control plane and lets applications read their own coo
   assert.ok(r.locations.includes('location = /_gateway/tunnel'));
   assert.ok(r.locations.includes('location = /_gateway/me'));
   assert.ok(r.locations.includes('location = /_gateway/codes'));
+  // Publishing is a platform-to-gateway call, so this route has to be reachable
+  // from outside the host like `/_gateway/codes` is.
+  assert.ok(r.locations.includes('location ^~ /_gateway/apps'));
   assert.ok(r.locations.includes('location ^~ /_launch/'));
   assert.ok(r.locations.includes('location = /api/apps'));
   assert.ok(r.locations.includes('proxy_pass http://127.0.0.1:22445'));
@@ -259,7 +271,7 @@ test('gateway exposes the control plane and lets applications read their own coo
   const controlBlock = r.locations.split('location ^~ /demo/')[0];
   const toControl = controlBlock.match(/proxy_pass http:\/\/127\.0\.0\.1:22445;/g) || [];
   const forwarded = controlBlock.match(/proxy_pass http:\/\/127\.0\.0\.1:22445; proxy_set_header Host \$host;/g) || [];
-  assert.equal(toControl.length, 6, 'expected the six shared control routes');
+  assert.equal(toControl.length, 7, 'expected the seven shared control routes');
   assert.equal(forwarded.length, toControl.length, 'every control route must forward the browser Host');
   assert.ok(!renderGateway({ ...CONFIG, controlPort: undefined }).locations.includes('/_gateway/me'), 'control routes are optional');
   for (const controlPort of [80, '22445', 0]) assert.throws(() => renderGateway({ ...CONFIG, controlPort }));
@@ -655,4 +667,275 @@ test('a handshake list is validated like every other outbound URL', () => {
   }
   assert.ok(createControlPlane({ ...plain, handshakeUrls: [] }), 'an empty list falls back to the single handshake URL');
 });
+
+// --- Application registration ------------------------------------------------
+//
+// Publishing used to be an edit to the gateway host's own config file by whoever
+// owned that machine. These tests drive the interface that replaces it: a
+// control-token call that picks the port, persists the application and makes it
+// visible everywhere at once. Every test that writes runs against a real config
+// file, because re-reading that file is the whole mechanism.
+
+// A fresh copy per test: a registration must not leak into the next test's port
+// space, and the assertions compare the file before and after a refusal.
+function registrationConfig(extraApps = []) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cag-config-'));
+  const file = path.join(dir, 'gateway.json');
+  const content = { ...CONFIG, apps: [...CONFIG.apps.map(app => ({ ...app })), ...extraApps] };
+  fs.writeFileSync(file, JSON.stringify(content, null, 2) + '\n', { mode: 0o600 });
+  return { file, content, configPath: file, read: () => JSON.parse(fs.readFileSync(file, 'utf8')) };
+}
+
+function registration(overrides = {}) {
+  return { id: 'board', title: '我的看板', agent: '365', publicKey: 'ssh-ed25519 AAAABOARD board', ...overrides };
+}
+
+async function apps(base, { method = 'GET', path = '/_gateway/apps', body, token = CONTROL_TOKEN } = {}) {
+  const res = await fetch(`${base}${path}`, {
+    method,
+    headers: {
+      ...(token === null ? {} : { Authorization: `Bearer ${token}` }),
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)),
+  });
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+test('registration requires the control token for every method', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    for (const call of [
+      { method: 'GET' },
+      { method: 'POST', body: registration() },
+      { method: 'DELETE', path: '/_gateway/apps/demo' },
+    ]) {
+      const anonymous = await apps(base, { ...call, token: null });
+      assert.equal(anonymous.status, 401, `${call.method} must refuse an anonymous caller`);
+      const wrong = await apps(base, { ...call, token: 'x'.repeat(33) });
+      assert.equal(wrong.status, 401, `${call.method} must refuse a wrong token`);
+    }
+    assert.equal((await apps(base, { method: 'PUT' })).status, 405);
+    assert.deepEqual(config.read(), config.content, 'a refused caller must not touch the config');
+  }, config);
+});
+
+test('a registration is assigned a port and answers with every public URL', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const first = await apps(base, { method: 'POST', body: registration({ localPort: 20000 }) });
+    assert.equal(first.status, 201);
+    assert.equal(first.body.status, 'registered');
+    assert.equal(first.body.id, 'board');
+    assert.equal(first.body.title, '我的看板');
+    assert.equal(first.body.agent, '365');
+    // The documented allocation: the first free port at or above 28201.
+    assert.equal(first.body.remote_port, 28201);
+    assert.deepEqual(first.body.urls, ['https://artifact.example.cc/board/', 'https://artifact.example.cn/board/']);
+    assert.equal(first.body.url, first.body.urls[0], 'the single url is the first public domain');
+    assert.equal(first.body.transport_url, 'wss://artifact.example.cc/_gateway/tunnel');
+    assert.equal(first.body.local_port, 20000, 'the local port is echoed, not acted on');
+    assert.equal(new Date(first.body.updated_at).toISOString(), first.body.updated_at);
+
+    // The port belongs to the gateway: a caller-supplied one is ignored rather
+    // than allowed to collide with a running tunnel.
+    const second = await apps(base, { method: 'POST', body: registration({ id: 'second', title: 'Second', publicKey: 'ssh-ed25519 AAAASECOND second', remotePort: 28191 }) });
+    assert.equal(second.status, 201);
+    assert.equal(second.body.remote_port, 28202);
+
+    const onDisk = config.read();
+    assert.deepEqual(onDisk.apps.map(app => app.id), ['demo', 'other', 'board', 'second']);
+    assert.deepEqual(onDisk.apps[2], { id: 'board', title: '我的看板', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board', localPort: 20000 });
+    assert.equal(fs.statSync(config.configPath).mode & 0o777, 0o600, 'the config keeps its mode');
+  }, config);
+});
+
+test('an application without an owner is refused', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const missing = await apps(base, { method: 'POST', body: registration({ agent: undefined }) });
+    assert.equal(missing.status, 400);
+    assert.equal(missing.body.error, 'agent_required');
+    for (const agent of ['', null, 0, '0', 'bot', -1]) {
+      const res = await apps(base, { method: 'POST', body: registration({ agent }) });
+      assert.equal(res.status, 400, `agent ${JSON.stringify(agent)} must be refused`);
+    }
+    assert.deepEqual(config.read(), config.content, 'not one refused registration may be persisted');
+  }, config);
+});
+
+test('every registration passes through the renderer', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const rejected = [
+      ['malformed id', registration({ id: 'Bad Id' })],
+      ['empty id', registration({ id: '' })],
+      ['uppercase id', registration({ id: 'Board' })],
+      ['over-long id', registration({ id: `b${'x'.repeat(48)}` })],
+      ['missing key', registration({ publicKey: undefined })],
+      ['non ed25519 key', registration({ publicKey: 'ssh-rsa AAAABOARD board' })],
+      ['truncated key', registration({ publicKey: 'ssh-ed25519' })],
+      ['key with a newline', registration({ publicKey: 'ssh-ed25519 AAAABOARD\nboard' })],
+      ['key of another application', registration({ publicKey: 'ssh-ed25519 AAAATEST demo' })],
+      ['over-long title', registration({ title: 'x'.repeat(61) })],
+      ['unprivileged local port', registration({ localPort: 80 })],
+      ['non numeric local port', registration({ localPort: '20000' })],
+    ];
+    for (const [label, body] of rejected) {
+      const res = await apps(base, { method: 'POST', body });
+      assert.equal(res.status, 400, `${label} must be refused`);
+      assert.ok(res.body.message, `${label} must report the renderer's reason`);
+      assert.ok(!JSON.stringify(res.body).includes('publicHosts'), 'a failure must not echo the config back');
+    }
+    assert.equal((await apps(base, { method: 'POST', body: 'not json' })).body.error, 'invalid_json');
+    assert.equal((await apps(base, { method: 'POST', body: '[1,2]' })).status, 400);
+    assert.deepEqual(config.read(), config.content, 'nothing that failed validation may be persisted');
+  }, config);
+});
+
+test('re-registering an application keeps its remote port and its title', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const first = await apps(base, { method: 'POST', body: registration() });
+    const again = await apps(base, { method: 'POST', body: registration({ publicKey: 'ssh-ed25519 AAAAROTATED board', localPort: 20011 }) });
+    assert.equal(again.status, 201);
+    assert.equal(again.body.status, 'updated');
+    assert.equal(again.body.remote_port, first.body.remote_port, 'a running tunnel must not be moved');
+
+    const retitled = await apps(base, { method: 'POST', body: registration({ title: undefined, publicKey: 'ssh-ed25519 AAAALATER board' }) });
+    assert.equal(retitled.body.title, '我的看板', 'a caller that sends no title cannot rename the sidebar entry');
+
+    const stored = config.read().apps.filter(app => app.id === 'board');
+    assert.equal(stored.length, 1, 'an update replaces the entry instead of adding one');
+    assert.deepEqual(stored[0], { id: 'board', title: '我的看板', agent: '365', remotePort: first.body.remote_port, publicKey: 'ssh-ed25519 AAAALATER board', localPort: 20011 });
+  }, config);
+});
+
+test('an application cannot be taken over by re-registering its id', async () => {
+  // An update replaces the entry by id, so a caller that skipped its own
+  // ownership check could otherwise move another account's application — and the
+  // public key, and the port its connector forwards — onto itself.
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const mine = await apps(base, { method: 'POST', body: registration({ id: 'taken', agent: '365', publicKey: 'ssh-ed25519 AAAAOWNER taken' }) });
+    assert.equal(mine.status, 201);
+
+    const stolen = await apps(base, { method: 'POST', body: registration({ id: 'taken', agent: '999', publicKey: 'ssh-ed25519 AAAATHIEF taken' }) });
+    assert.equal(stolen.status, 409);
+    assert.equal(stolen.body.error, 'agent_mismatch');
+
+    // An application that declares no owner is not up for grabs either.
+    const orphan = await apps(base, { method: 'POST', body: registration({ id: 'other', agent: '999', publicKey: 'ssh-ed25519 AAAAORPHAN other' }) });
+    assert.equal(orphan.status, 409);
+
+    // Untouched: same owner, same key, same port.
+    const stored = config.read().apps.filter(app => app.id === 'taken');
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].agent, '365');
+    assert.equal(stored[0].publicKey, 'ssh-ed25519 AAAAOWNER taken');
+    assert.equal(stored[0].remotePort, mine.body.remote_port);
+
+    // The owner can still update, and still keeps the port.
+    const again = await apps(base, { method: 'POST', body: registration({ id: 'taken', agent: '365', publicKey: 'ssh-ed25519 AAAAROTATED taken' }) });
+    assert.equal(again.status, 201);
+    assert.equal(again.body.status, 'updated');
+    assert.equal(again.body.remote_port, mine.body.remote_port);
+  }, config);
+});
+
+test('a new application is visible to every route at once', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    const created = await apps(base, { method: 'POST', body: registration() });
+    assert.equal(created.status, 201);
+
+    const listed = await apps(base);
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.apps.map(app => app.id), ['demo', 'other', 'board']);
+    const board = listed.body.apps.find(app => app.id === 'board');
+    assert.equal(board.remote_port, created.body.remote_port);
+    assert.equal(board.agent, '365');
+    assert.deepEqual(board.urls, created.body.urls);
+    assert.ok(!('publicKey' in board), 'the inventory never reads the public key back');
+    assert.ok(!JSON.stringify(listed.body).includes('AAAABOARD'));
+
+    const sidebar = await (await fetch(`${base}/api/apps`)).json();
+    assert.deepEqual(sidebar.apps.map(app => app.id), ['demo', 'other', 'board']);
+    assert.equal(sidebar.apps[2].url, 'https://artifact.example.cc/board/');
+
+    // `known` was recomputed with the same snapshot, so the identity routes
+    // stopped answering 404 for the application that just appeared.
+    const me = await fetch(`${base}/_gateway/me?app=board`);
+    assert.equal(me.status, 200);
+    assert.deepEqual(await me.json(), { contract: VIEWER_CONTRACT, authenticated: false, viewer: null, app_id: 'board', topic_id: null, expires_at: null });
+
+    const { body } = await issue(base, { app: 'board', uid: 'u1' });
+    assert.equal((await fetch(`${body.launch_url.replace('https://artifact.example.cc', base)}`, { redirect: 'manual' })).status, 302);
+    assert.equal((await fetch(`${base}/_auth/declined?app=board`)).status, 200);
+  }, config);
+});
+
+test('two registrations in flight both persist', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    // The read-modify-write is synchronous inside each request, so the event
+    // loop cannot interleave two of them: no update can be lost.
+    const [one, two] = await Promise.all([
+      apps(base, { method: 'POST', body: registration({ id: 'alpha', publicKey: 'ssh-ed25519 AAAAALPHA alpha' }) }),
+      apps(base, { method: 'POST', body: registration({ id: 'beta', publicKey: 'ssh-ed25519 AAAABETA beta' }) }),
+    ]);
+    assert.equal(one.status, 201);
+    assert.equal(two.status, 201);
+    assert.deepEqual(config.read().apps.map(app => app.id), ['demo', 'other', 'alpha', 'beta']);
+    assert.notEqual(one.body.remote_port, two.body.remote_port);
+  }, config);
+});
+
+test('an application can be unregistered, but not the last one', async () => {
+  const config = registrationConfig();
+  await withServer(async ({ base }) => {
+    await apps(base, { method: 'POST', body: registration() });
+    const removed = await apps(base, { method: 'DELETE', path: '/_gateway/apps/board' });
+    assert.equal(removed.status, 200);
+    assert.deepEqual(removed.body, { status: 'removed', id: 'board' });
+    assert.deepEqual(config.read().apps.map(app => app.id), ['demo', 'other']);
+    assert.equal((await fetch(`${base}/_gateway/me?app=board`)).status, 404, 'the routes forget it immediately');
+    assert.equal((await apps(base)).body.apps.length, 2);
+
+    assert.equal((await apps(base, { method: 'DELETE', path: '/_gateway/apps/board' })).status, 404, 'removing twice is a 404');
+    assert.equal((await apps(base, { method: 'DELETE', path: '/_gateway/apps/ghost' })).status, 404, 'an unknown id is a 404');
+    assert.equal((await apps(base, { method: 'GET', path: '/_gateway/apps/board' })).status, 405);
+
+    assert.equal((await apps(base, { method: 'DELETE', path: '/_gateway/apps/demo' })).status, 200);
+    const last = await apps(base, { method: 'DELETE', path: '/_gateway/apps/other' });
+    assert.equal(last.status, 409, 'an empty application list cannot be rendered');
+    assert.equal(last.body.error, 'last_application');
+    assert.deepEqual(config.read().apps.map(app => app.id), ['other']);
+  }, config);
+});
+
+test('an exhausted port range is reported instead of reused', async () => {
+  // A one-port range that is already taken: the allocation must fail loudly
+  // rather than hand out a port a running tunnel is using.
+  const config = registrationConfig([{ id: 'taken', remotePort: 28200, publicKey: 'ssh-ed25519 AAAATAKEN taken', agent: '365' }]);
+  await withServer(async ({ base }) => {
+    const res = await apps(base, { method: 'POST', body: registration() });
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error, 'no_free_remote_port');
+    assert.match(res.body.message, /28200 and 28200/);
+    assert.deepEqual(config.read(), config.content);
+  }, { configPath: config.configPath, remotePortBase: 28200, remotePortCeiling: 28200 });
+});
+
+test('registration is unavailable without a config file to write', async () => {
+  await withServer(async ({ base }) => {
+    assert.equal((await apps(base)).status, 200, 'the inventory still answers from the loaded config');
+    for (const call of [{ method: 'POST', body: registration() }, { method: 'DELETE', path: '/_gateway/apps/demo' }]) {
+      const res = await apps(base, call);
+      assert.equal(res.status, 503);
+      assert.equal(res.body.error, 'registration_unavailable');
+    }
+  });
+});
+
 

@@ -1,0 +1,11 @@
+# Applies gateway.json to nginx and the isolated sshd; see deploy/apply-config.sh.
+#
+# Install this pair once on the gateway host; publishing is an API call from then
+# on, and cag_ingress still has no sudo.
+[Unit]
+Description=Apply the Artifact gateway config to nginx and the isolated sshd
+ConditionPathExists=/etc/catsco-artifact-gateway/gateway.json
+
+[Service]
+Type=oneshot
+ExecStart=/opt/catsco-artifact-gateway/deploy/apply-config.sh

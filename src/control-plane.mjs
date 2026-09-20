@@ -6,7 +6,11 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import { appId, COOKIE_NAME, isToken, ViewerStore, VIEWER_CONTRACT, viewerIdentity } from './viewer-store.mjs';
-import { cookieName, httpsUrl } from './config.mjs';
+import { cookieName, httpsUrl, port } from './config.mjs';
+// Registration validates a candidate config with the very renderer the
+// deployment uses, so a registration that would break sshd or nginx fails here
+// instead of at the next apply.
+import { renderGateway } from './gateway-config.mjs';
 
 // Default platform handshake page. It must be the file the platform actually
 // serves: the single-page app owns every extension-less path, so a bare
@@ -21,6 +25,22 @@ const PLATFORM_TIMEOUT_MS = 3000;
 // A platform cookie is an opaque `<uid:exp.hmac>` blob; this is a sanity bound,
 // not a parse. The gateway never reads a field out of it.
 const MAX_PLATFORM_COOKIE = 4096;
+
+// Remote ports are assigned by the gateway, never taken from a caller, so a new
+// application can collide neither with the fixed gateway ports nor with a
+// tunnel that is already up. The base sits above sshPort (22443), the WSS
+// adapter (22444), the control plane (22445) and the two ports the deployed
+// gateway already registered (28191, 28192), which makes the first assignment
+// predictable: 28201.
+const REMOTE_PORT_BASE = 28201;
+const REMOTE_PORT_CEILING = 65535;
+// Fixed by the rendered nginx include (`proxy_pass http://127.0.0.1:22444`), so
+// it is reserved here as a constant instead of being read from the config.
+const WSS_PORT = 22444;
+// The same rule the connector applies to its own tunnel endpoint
+// (`validateConnector` in config.mjs). Repeated rather than shared because this
+// direction is the gateway publishing an endpoint to bots, not accepting one.
+const TRANSPORT_URL_PATTERN = /^wss:\/\/[a-zA-Z0-9.-]+(?::[0-9]+)?\/[a-zA-Z0-9/_-]+$/;
 
 function json(res, status, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
@@ -258,6 +278,36 @@ function agentRef(value) {
   return value;
 }
 
+// Everything the routes need out of a gateway config, derived in one place so a
+// reload cannot update one of `hosts`, `known` and the app list without the
+// others. `stamp` is the file identity the view was read from; a view without
+// one is always considered stale, which is how a freshly written config gets
+// re-read instead of being trusted from memory.
+function viewOf(config, { updatedAt = null, stamp = null } = {}) {
+  const hosts = Array.isArray(config?.publicHosts) ? [...config.publicHosts] : [];
+  // Without a host there is no public URL to hand back, and the empty string
+  // would silently produce `https://undefined/...` in a launch response.
+  if (hosts.length === 0) throw new Error('At least one public host is required');
+  return { config, hosts, known: new Set((config.apps || []).map(app => app.id)), updatedAt, stamp };
+}
+
+// The ports the renderer already claims: the SSH transport, the WSS adapter and
+// the control plane. Applications must never be handed one of them.
+function reservedPorts(view) {
+  return [view.config.sshPort, WSS_PORT, view.config.controlPort].filter(value => Number.isInteger(value));
+}
+
+// First free port at or above the base. Skipping every registered port makes the
+// renderer's uniqueness rule hold by construction - the renderer still has the
+// last word, this only avoids asking it to reject a registration the gateway
+// itself could have predicted.
+function allocateRemotePort(apps, { base, ceiling, reserved }) {
+  const used = new Set(reserved);
+  for (const app of apps) used.add(app.remotePort);
+  for (let candidate = base; candidate <= ceiling; candidate++) if (!used.has(candidate)) return candidate;
+  return null;
+}
+
 export function createControlPlane({
   config,
   store,
@@ -265,6 +315,10 @@ export function createControlPlane({
   corsOrigins = [],
   cookieSecure = true,
   configUpdatedAt = null,
+  configPath = null,
+  transportUrl = null,
+  remotePortBase = REMOTE_PORT_BASE,
+  remotePortCeiling = REMOTE_PORT_CEILING,
   logger = console,
   handshakeUrl = DEFAULT_HANDSHAKE_URL,
   handshakeUrls = null,
@@ -275,10 +329,18 @@ export function createControlPlane({
 }) {
   if (!controlToken || controlToken.length < 32) throw new Error('Control token must be at least 32 characters');
   if (!store) throw new Error('Viewer store is required');
-  const hosts = [...config.publicHosts];
-  // Without a host there is no public URL to hand back, and the empty string
-  // would silently produce `https://undefined/...` in a launch response.
-  if (hosts.length === 0) throw new Error('At least one public host is required');
+  // The tunnel endpoint a bot should connect to. Nothing in the installed
+  // deployment carries it (no config field, no environment variable on the
+  // gateway host), so it defaults to the first public domain - the value every
+  // deployed connector actually uses. Pinned at startup on purpose: it is only
+  // echoed back to callers, so a change does not need to be live.
+  if (transportUrl !== null && transportUrl !== undefined && transportUrl !== '' && !TRANSPORT_URL_PATTERN.test(String(transportUrl))) throw new Error('Invalid transport URL');
+  const pinnedTransportUrl = transportUrl || null;
+  for (const [label, value] of [['remote port base', remotePortBase], ['remote port ceiling', remotePortCeiling]]) {
+    if (!Number.isInteger(value) || value < 1024 || value > 65535) throw new Error(`Invalid ${label}`);
+  }
+  if (remotePortBase > remotePortCeiling) throw new Error('Empty remote port range');
+  let view = viewOf(config, { updatedAt: configUpdatedAt });
   // One handshake page per public domain, picked by the same suffix rule as the
   // launch URL: a visitor on `.cn` must be sent to the `.cn` login, not to the
   // other domain where they may not be signed in. Every configured entry is
@@ -292,7 +354,198 @@ export function createControlPlane({
   // exactly as it did before the path existed.
   const platformUrl = platformIdentityUrl ? httpsUrl(platformIdentityUrl, 'platform identity URL') : null;
   const platformName = cookieName(platformCookieName);
-  const known = new Set((config.apps || []).map(app => app.id));
+
+  // --- Live configuration -----------------------------------------------------
+  //
+  // Registration writes the very gateway.json this process was started from,
+  // and every route below is derived from it: the sidebar list, the `known` set
+  // that gates /_gateway/me and /_launch/, the public hosts. Re-reading the file
+  // (instead of mutating an in-memory copy after our own writes) keeps one
+  // source of truth: a hand edit, scripts/register-app.mjs or a second writer is
+  // picked up too, and the copy in memory cannot drift away from the file the
+  // root applier renders from. The file is a few hundred bytes and the stat
+  // below is the only per-request cost.
+  function currentConfig() {
+    if (!configPath) return view;
+    let stat;
+    try {
+      stat = fs.statSync(configPath);
+    } catch {
+      // A momentarily unreadable file is not a reason to stop serving the
+      // gateway: the last good view stays in use.
+      return view;
+    }
+    const stamp = `${stat.mtimeMs}:${stat.size}`;
+    if (view.stamp === stamp) return view;
+    try {
+      view = viewOf(JSON.parse(fs.readFileSync(configPath, 'utf8')), { updatedAt: stat.mtime.toISOString(), stamp });
+    } catch (error) {
+      // Same for a file an operator is halfway through editing.
+      logger.error(JSON.stringify({ event: 'config_reload_failed', message: error?.message }));
+    }
+    return view;
+  }
+
+  // Replace by rename, like scripts/register-app.mjs: nginx, sshd and the root
+  // applier all render from this file, so a half-written gateway.json must never
+  // be observable. Ownership survives the rename because the service user owns
+  // both the old file and the temporary one; the mode is carried over so that a
+  // registration is never the step that widens it.
+  function writeConfig(next) {
+    const mode = (() => { try { return fs.statSync(configPath).mode & 0o777; } catch { return 0o600; } })();
+    const tmp = `${configPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { mode });
+    fs.chmodSync(tmp, mode);
+    fs.renameSync(tmp, configPath);
+  }
+
+  // `updated_at` is the config file's own timestamp, read after the write so it
+  // describes the file the caller's application was registered in.
+  function configTimestamp() {
+    if (!configPath) return new Date().toISOString();
+    try {
+      return fs.statSync(configPath).mtime.toISOString();
+    } catch {
+      return new Date().toISOString();
+    }
+  }
+
+  function publicUrls(hosts, id) {
+    return hosts.map(host => `https://${host}/${id}/`);
+  }
+
+  function transportUrlFor(current) {
+    return pinnedTransportUrl || `wss://${current.hosts[0]}/_gateway/tunnel`;
+  }
+
+  // Exactly the fields the platform hands back to the bot that published the
+  // application. The public key stays on the gateway: the caller published it,
+  // and the list must never read it back out.
+  function registeredApp(app, current) {
+    const urls = publicUrls(current.hosts, app.id);
+    const local = app.localPort === undefined || app.localPort === null ? {} : { local_port: app.localPort };
+    return {
+      id: app.id,
+      title: typeof app.title === 'string' && app.title.trim() ? app.title.trim() : app.id,
+      agent: app.agent === undefined ? null : String(app.agent),
+      remote_port: app.remotePort,
+      url: urls[0],
+      urls,
+      ...local,
+      updated_at: current.updatedAt,
+    };
+  }
+
+  function listApplications(current) {
+    return (current.config.apps || []).map(app => registeredApp(app, current));
+  }
+
+  // The same reply for POST, so a caller that just registered and a caller that
+  // listed see one shape per application.
+  function registrationReply(current, app, status) {
+    return { status, ...registeredApp(app, current), transport_url: transportUrlFor(current) };
+  }
+
+  async function registerApplication(req, res) {
+    if (!configPath) return json(res, 503, { error: 'registration_unavailable' });
+    let body;
+    try {
+      body = JSON.parse((await readBody(req)) || '{}');
+    } catch {
+      return json(res, 400, { error: 'invalid_json' });
+    }
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'invalid_json' });
+    // Ownership decides whose sidebar the application appears in, so an
+    // application that declares no owner is refused here rather than registered
+    // into no one's list.
+    if (body.agent === undefined || body.agent === null || body.agent === '') return json(res, 400, { error: 'agent_required' });
+    if (body.localPort !== undefined && body.localPort !== null) {
+      try { port(body.localPort); } catch (error) { return json(res, 400, { error: 'invalid_local_port', message: error.message }); }
+    }
+    const text = value => (typeof value === 'string' ? value.trim() : value);
+    const id = text(body.id);
+    const current = currentConfig();
+    const apps = Array.isArray(current.config.apps) ? current.config.apps : [];
+    const previous = apps.find(app => app.id === id);
+    // Registering an existing id replaces that entry, and the owner recorded here
+    // is what decides whose sidebar the application appears in. The platform
+    // proves ownership before it calls, but this is the last line of defence: a
+    // caller that forgot would otherwise move another account's application —
+    // and the port its connector is forwarding — onto itself.
+    const agent = String(body.agent).trim();
+    if (previous && String(previous.agent ?? '') !== agent) {
+      return json(res, 409, { error: 'agent_mismatch' });
+    }
+    // An update keeps the port the running connector was told to forward:
+    // moving it would break a tunnel that is already up.
+    const remotePort = previous
+      ? previous.remotePort
+      : allocateRemotePort(apps, { base: remotePortBase, ceiling: remotePortCeiling, reserved: reservedPorts(current) });
+    if (!Number.isInteger(remotePort)) {
+      return json(res, 409, { error: 'no_free_remote_port', message: `No free remote port between ${remotePortBase} and ${remotePortCeiling}` });
+    }
+    const entry = {
+      id,
+      // An update without a title keeps the one already published, so a caller
+      // that only sends the key cannot silently rename somebody's sidebar entry.
+      title: text(body.title) ?? previous?.title ?? id,
+      agent,
+      remotePort,
+      publicKey: text(body.publicKey),
+    };
+    // Same rule as the title: an update that does not send a local port keeps
+    // the recorded one, so rotating a key cannot erase what the connector was
+    // told to forward.
+    const localPort = body.localPort === undefined || body.localPort === null ? previous?.localPort : body.localPort;
+    if (localPort !== undefined && localPort !== null) entry.localPort = localPort;
+    const status = previous ? 'updated' : 'registered';
+    const next = { ...current.config, apps: [...apps.filter(app => app.id !== id), entry] };
+    // The renderer is the only validator: it already rejects a malformed id, a
+    // duplicate port, a duplicate key, a non-ed25519 key and a bot uid that is
+    // not a positive integer, for sshd and nginx alike.
+    try {
+      renderGateway(next);
+    } catch (error) {
+      return json(res, 400, { error: 'invalid_registration', message: error.message });
+    }
+    try {
+      writeConfig(next);
+    } catch (error) {
+      logger.error(JSON.stringify({ event: 'config_write_failed', message: error?.message }));
+      return json(res, 500, { error: 'config_write_failed' });
+    }
+    // Publish locally before answering, with no stamp: the caller is now told
+    // the application is live, so the next request on this process must already
+    // see it, and reading it back from disk keeps the file authoritative.
+    view = viewOf(next, { updatedAt: configTimestamp() });
+    return json(res, 201, registrationReply(view, entry, status));
+  }
+
+  function removeApplication(id, res) {
+    if (!configPath) return json(res, 503, { error: 'registration_unavailable' });
+    const current = currentConfig();
+    if (!current.known.has(id)) return json(res, 404, { error: 'unknown_app' });
+    const apps = (current.config.apps || []).filter(app => app.id !== id);
+    // An empty application list cannot be rendered at all - sshd needs at least
+    // one PermitListen and nginx would keep no application route - so the last
+    // removal is refused here instead of surfacing a renderer error for what is
+    // a well formed request.
+    if (!apps.length) return json(res, 409, { error: 'last_application' });
+    const next = { ...current.config, apps };
+    try {
+      renderGateway(next);
+    } catch (error) {
+      return json(res, 400, { error: 'invalid_registration', message: error.message });
+    }
+    try {
+      writeConfig(next);
+    } catch (error) {
+      logger.error(JSON.stringify({ event: 'config_write_failed', message: error?.message }));
+      return json(res, 500, { error: 'config_write_failed' });
+    }
+    view = viewOf(next, { updatedAt: configTimestamp() });
+    return json(res, 200, { status: 'removed', id });
+  }
 
   // The silent path: a platform-signed visitor becomes a user record, with the
   // same pseudonym the one-shot code path mints for the same uid. There is no
@@ -337,11 +590,14 @@ export function createControlPlane({
   return http.createServer(async (req, res) => {
     let url;
     try {
-      url = new URL(req.url, `https://${hosts[0]}`);
+      url = new URL(req.url, `https://${view.hosts[0]}`);
     } catch {
       return json(res, 400, { error: 'bad_request' });
     }
     const path = url.pathname;
+    // One snapshot per request, so a reload that lands mid-request cannot make
+    // the routes disagree with each other about which applications exist.
+    const current = currentConfig();
 
     try {
       // Public read-only list for the CatsCompany sidebar.
@@ -349,12 +605,31 @@ export function createControlPlane({
         if (req.method === 'OPTIONS') return json(res, 204, {}, corsHeaders(req));
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         const agent = agentRef(url.searchParams.get('agent'));
-        return json(res, 200, { apps: buildAppList(config, { updatedAt: configUpdatedAt, agent }) }, corsHeaders(req));
+        return json(res, 200, { apps: buildAppList(current.config, { updatedAt: current.updatedAt, agent }) }, corsHeaders(req));
       }
 
       if (path === '/_gateway/health') {
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
-        return json(res, 200, { ok: true, apps: known.size, ...store.stats() });
+        return json(res, 200, { ok: true, apps: current.known.size, ...store.stats() });
+      }
+
+      // Application inventory and registration. This is the interface that turns
+      // "publish" into an API instead of an edit to the gateway host's own
+      // config file, so it is deliberately absent from the rendered nginx
+      // include: it is reached on the loopback control port by the platform (the
+      // only caller that holds the control token), never from a public domain.
+      if (path === '/_gateway/apps' || path.startsWith('/_gateway/apps/')) {
+        if (!constantTimeEqual(bearerToken(req) || '', controlToken)) return json(res, 401, { error: 'unauthorized' });
+        if (path !== '/_gateway/apps') {
+          // The id charset is URL-safe, so the raw path segment is the id and a
+          // percent-encoded one simply matches nothing.
+          const id = path.slice('/_gateway/apps/'.length);
+          if (req.method !== 'DELETE') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'DELETE' });
+          return removeApplication(id, res);
+        }
+        if (req.method === 'GET') return json(res, 200, { apps: listApplications(current) });
+        if (req.method === 'POST') return registerApplication(req, res);
+        return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, POST' });
       }
 
       // Internal issuance. CatsCompany calls this with the shared control
@@ -364,13 +639,13 @@ export function createControlPlane({
         if (!constantTimeEqual(bearerToken(req) || '', controlToken)) return json(res, 401, { error: 'unauthorized' });
         const body = JSON.parse((await readBody(req)) || '{}');
         const app = appId(body.app);
-        if (!known.has(app)) return json(res, 404, { error: 'unknown_app' });
+        if (!current.known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const { code, expiresAt } = store.issueCode({ app, uid: body.uid, username: body.username, topic: body.topic ?? null });
         // The caller says which of our public domains its user is signed in to.
         // That is only a hint: it is matched against the configured list, so an
         // unknown value degrades to the default host instead of pointing the
         // browser at an attacker-chosen one.
-        const host = matchBySuffix(hosts, body.host);
+        const host = matchBySuffix(current.hosts, body.host);
         return json(res, 201, {
           app_id: app,
           code,
@@ -410,10 +685,10 @@ export function createControlPlane({
       if (path === '/_auth/start') {
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         const app = appId(url.searchParams.get('app') || '');
-        if (!known.has(app)) return json(res, 404, { error: 'unknown_app' });
+        if (!current.known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const next = safeNext(url.searchParams.get('next'), app);
         const handshake = matchBySuffix(handshakeList, req.headers.host);
-        res.writeHead(302, { Location: handshakeTarget(handshake, app, next, gatewayOrigin(req, hosts)), 'Cache-Control': 'no-store' });
+        res.writeHead(302, { Location: handshakeTarget(handshake, app, next, gatewayOrigin(req, current.hosts)), 'Cache-Control': 'no-store' });
         return res.end();
       }
 
@@ -422,7 +697,7 @@ export function createControlPlane({
       if (path === '/_auth/declined') {
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         const app = appId(url.searchParams.get('app') || '');
-        if (!known.has(app)) return json(res, 404, { error: 'unknown_app' });
+        if (!current.known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const next = safeNext(url.searchParams.get('next'), app);
         const page = choicePage(app, next);
         res.writeHead(200, {
@@ -445,7 +720,7 @@ export function createControlPlane({
       if (path === '/_gateway/me') {
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         const app = appFromRequest(req, url);
-        if (!app || !known.has(app)) return json(res, 404, { error: 'unknown_app' });
+        if (!app || !current.known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const token = cookieToken(req) || bearerToken(req);
         if (token) {
           const viewer = store.viewerRecord(token, app);
@@ -488,6 +763,15 @@ export function loadControlPlaneFromEnv({ configPath, env = process.env, logger 
       corsOrigins: (env.CAG_CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
       cookieSecure: env.CAG_COOKIE_INSECURE !== '1',
       configUpdatedAt,
+      // Registration needs the path as well as the parsed config: it writes the
+      // same file back and re-reads it, so an application registered here is
+      // visible to every other route without a restart.
+      configPath,
+      // The deployed connectors reach the tunnel on the first public domain
+      // (`wss://artifact.catsco.cc/_gateway/tunnel`), which is exactly what the
+      // derived default produces; an explicit value comes from the unit's
+      // environment or from `transportUrl` in the config file.
+      transportUrl: env.CAG_TRANSPORT_URL || config.transportUrl || null,
       handshakeUrl: env.CAG_HANDSHAKE_URL || config.handshakeUrl || undefined,
       handshakeUrls: config.handshakeUrls,
       platformIdentityUrl: env.CAG_PLATFORM_IDENTITY_URL ?? PLATFORM_IDENTITY_URL,
