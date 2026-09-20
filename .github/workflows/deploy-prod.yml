@@ -54,8 +54,10 @@ jobs:
       - name: Ensure the runtime dependency is present
         # The control plane is a plain node process; `ws` is its only dependency
         # and it is already installed on the host. Failing loudly here is better
-        # than deploying a process that cannot load.
-        run: ssh cag "test -d $GATEWAY_ROOT/node_modules/ws || { echo 'missing node_modules/ws — run npm ci in $GATEWAY_ROOT on the gateway host'; exit 1; }"
+        # than deploying a process that cannot load. The check needs sudo: the
+        # gateway tree is root-owned and node_modules is 0750, so the deploy user
+        # cannot see it without asking.
+        run: ssh cag "sudo -n test -d $GATEWAY_ROOT/node_modules/ws || { echo 'missing node_modules/ws — run npm ci in $GATEWAY_ROOT on the gateway host'; exit 1; }"
 
       - name: Install or refresh the units
         # Everything here is idempotent: the root helper, the path unit that
