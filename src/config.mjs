@@ -22,6 +22,23 @@ export function appTitle(value) {
   if (!trimmed || trimmed.length > 60 || /[\r\n\0]/.test(trimmed)) throw new Error('Invalid application title');
   return trimmed;
 }
+// Absolute https endpoint on a named host with a restricted path charset and no
+// query, fragment or credentials. Shared by every URL the control plane calls
+// out to, so one integration cannot quietly weaken the rule for another.
+export function httpsUrl(value, field = 'URL') {
+  // The path may contain a dot: the platform handshake page is a real file
+  // (`artifact-auth.html`), because the platform's single-page app owns every
+  // extension-less path. Rejecting the dot here would make the correct value
+  // impossible to configure and abort startup.
+  if (typeof value !== 'string' || !/^https:\/\/[a-zA-Z0-9.-]+\/[a-zA-Z0-9/_.-]+$/.test(value)) throw new Error(`Invalid ${field}`);
+  return value;
+}
+// A cookie name is copied into an outbound request header, so it stays inside
+// the token charset instead of accepting separators or whitespace.
+export function cookieName(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(value)) throw new Error('Invalid cookie name');
+  return value;
+}
 export function validateConnector(c) {
   name(c.appId); name(c.user);
   if (typeof c.host !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(c.host)) throw new Error('Invalid gateway hostname');

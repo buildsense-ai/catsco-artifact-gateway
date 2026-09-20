@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, buildAppList, safeNext, handshakeTarget } from '../src/control-plane.mjs';
+import { createControlPlane, buildAppList, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -28,7 +29,21 @@ function tmpState() {
 
 async function withServer(fn, options = {}) {
   const store = new ViewerStore({ file: tmpState(), ...options });
-  const server = createControlPlane({ config: CONFIG, store, controlToken: CONTROL_TOKEN, cookieSecure: false, corsOrigins: ['https://app.example.cc'], handshakeUrl: options.handshakeUrl, logger: { error() {} } });
+  const server = createControlPlane({
+    config: CONFIG,
+    store,
+    controlToken: CONTROL_TOKEN,
+    cookieSecure: false,
+    corsOrigins: ['https://app.example.cc'],
+    handshakeUrl: options.handshakeUrl,
+    platformIdentityUrl: options.platformIdentityUrl,
+    platformCookieName: options.platformCookieName,
+    platformIdentityTimeoutMs: options.platformIdentityTimeoutMs,
+    // Default to a fetcher that refuses, so no test can silently reach the real
+    // platform; the platform tests inject a loopback one.
+    fetchImpl: options.fetchImpl || (() => { throw new Error('unexpected platform call'); }),
+    logger: { error() {} },
+  });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   try { return await fn({ base, store }); } finally { await new Promise(resolve => server.close(resolve)); }
@@ -256,6 +271,16 @@ test('return paths stay inside the requesting application', () => {
   ]) assert.equal(safeNext(hostile, 'demo'), '/demo/', `must be rejected: ${hostile}`);
 });
 
+test('the default handshake page is the file the platform actually serves', () => {
+  // The platform's single-page app owns every extension-less path, so a bare
+  // `/artifact-auth` renders the app itself and the exchange silently becomes a
+  // no-op. This guard keeps the default on the real file, and keeps the
+  // validator able to accept it.
+  assert.equal(DEFAULT_HANDSHAKE_URL, 'https://app.catsco.cc/artifact-auth.html');
+  const target = new URL(handshakeTarget(DEFAULT_HANDSHAKE_URL, 'demo', '/demo/', 'https://artifact.catsco.cc'));
+  assert.equal(target.pathname, '/artifact-auth.html');
+});
+
 test('handshake target carries the application, the return path and the gateway origin', () => {
   const target = new URL(handshakeTarget('https://app.example.cc/artifact-auth', 'demo', '/demo/page.html', 'https://artifact.example.cn'));
   assert.equal(target.origin, 'https://app.example.cc');
@@ -271,7 +296,7 @@ test('an application without a credential is sent to the platform handshake', as
     assert.equal(res.status, 302);
     const location = new URL(res.headers.get('location'));
     assert.equal(location.origin, 'https://app.catsco.cc');
-    assert.equal(location.pathname, '/artifact-auth');
+    assert.equal(location.pathname, '/artifact-auth.html');
     assert.equal(location.searchParams.get('app'), 'demo');
     assert.equal(location.searchParams.get('next'), '/demo/index.html');
 
@@ -303,4 +328,179 @@ test('a failed handshake offers login or guest instead of silently continuing', 
 test('the rendered gateway routes the auth handshake to the control plane', () => {
   assert.ok(renderGateway(CONFIG).locations.includes('location ^~ /_auth/'));
   assert.ok(!renderGateway({ ...CONFIG, controlPort: undefined }).locations.includes('/_auth/'));
+});
+
+// --- Platform domain cookie relay -------------------------------------------
+//
+// The platform sets `catsco_artifact_id` with Domain=.catsco.cc, so the browser
+// also sends it to the application host. These tests stand in for the platform
+// endpoint with a loopback server: the gateway is handed a normal https URL and
+// an injected fetcher re-points it at the stub, so the production URL rule stays
+// exactly as configured while the outbound request is still counted and read.
+
+const PLATFORM_COOKIE = 'catsco_artifact_id=363.1758260000.sig';
+const PLATFORM_EXPIRES = '2026-09-19T12:00:00.000Z';
+const GUEST = { contract: VIEWER_CONTRACT, authenticated: false, viewer: null, app_id: 'demo', topic_id: null, expires_at: null };
+
+function platformBody(body, status = 200) {
+  return (req, res) => {
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+}
+
+async function platformStub(handler = platformBody({})) {
+  const seen = [];
+  let calls = 0;
+  const server = http.createServer((req, res) => {
+    calls += 1;
+    seen.push({ url: req.url, cookie: req.headers.cookie, authorization: req.headers.authorization });
+    handler(req, res);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const stub = {
+    url: 'https://platform-identity.test/api/artifacts/identity',
+    seen,
+    calls: () => calls,
+    attempts: 0,
+    fetch: (uri, init) => { stub.attempts += 1; return fetch(origin + new URL(uri).pathname, init); },
+    close: async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); },
+  };
+  return stub;
+}
+
+function issueToken(base, uid) {
+  return issue(base, { app: 'demo', uid }).then(({ body }) => fetch(`${base}/_launch/${body.code}?format=json`).then(r => r.json()).then(r => r.token));
+}
+
+test('a gateway session answers /_gateway/me without asking the platform', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 363 }));
+  try {
+    await withServer(async ({ base }) => {
+      const token = await issueToken(base, 'u1');
+      const res = await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: `${COOKIE_NAME}=${token}; ${PLATFORM_COOKIE}` } });
+      const viewer = await res.json();
+      assert.equal(viewer.authenticated, true);
+      assert.equal(viewer.topic_id, null, 'the session record still wins, it carries the topic');
+      assert.equal(platform.attempts, 0, 'a gateway session must not cost a platform round trip');
+      assert.equal(platform.calls(), 0);
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('a platform domain cookie identifies the viewer without a launch code', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 363, expires_at: PLATFORM_EXPIRES }));
+  try {
+    await withServer(async ({ base, store }) => {
+      const res = await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } });
+      assert.equal(res.status, 200);
+      const viewer = await res.json();
+      assert.equal(viewer.contract, VIEWER_CONTRACT);
+      assert.equal(viewer.authenticated, true);
+      assert.equal(viewer.app_id, 'demo');
+      assert.equal(viewer.topic_id, null, 'a domain cookie carries no session context');
+      assert.equal(viewer.expires_at, PLATFORM_EXPIRES);
+      assert.equal(viewer.viewer.kind, 'user');
+      assert.match(viewer.viewer.id, /^ap_[A-Za-z0-9_-]{22}$/);
+      assert.equal(viewer.viewer.id, store.pseudonymFor('demo', '363'), 'the relay reuses the one-shot pseudonym');
+
+      const codeToken = await issueToken(base, 363);
+      const viaCode = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: `${COOKIE_NAME}=${codeToken}` } })).json();
+      assert.equal(viaCode.viewer.id, viewer.viewer.id, 'both entries must land on the same viewer id');
+
+      const other = await (await fetch(`${base}/_gateway/me?app=other`, { headers: { Cookie: PLATFORM_COOKIE } })).json();
+      assert.notEqual(other.viewer.id, viewer.viewer.id, 'the pseudonym stays application scoped');
+
+      assert.equal(platform.attempts, 2, 'one check per platform-cookie request, none for the code path');
+      assert.deepEqual(platform.seen[0], { url: '/api/artifacts/identity', cookie: PLATFORM_COOKIE, authorization: `Bearer ${CONTROL_TOKEN}` });
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('a platform cookie the platform will not confirm degrades to guest', async () => {
+  const rejecting = await platformStub(platformBody({ error: 'unauthorized' }, 401));
+  const denying = await platformStub(platformBody({ authenticated: false }));
+  const garbage = await platformStub((req, res) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('not json'); });
+  const hanging = await platformStub(() => { /* never answers */ });
+  const dead = await platformStub();
+  const deadUrl = dead.url;
+  const deadFetch = dead.fetch;
+  await dead.close();
+  try {
+    for (const [label, stub, options] of [
+      ['401', rejecting, {}],
+      ['authenticated false', denying, {}],
+      ['unreadable body', garbage, {}],
+      ['network error', null, { platformIdentityUrl: deadUrl, fetchImpl: deadFetch }],
+      ['timeout', hanging, { platformIdentityTimeoutMs: 120 }],
+    ]) {
+      await assert.doesNotReject(async () => {
+        await withServer(async ({ base }) => {
+          const res = await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } });
+          assert.equal(res.status, 200, `${label} must not fail the request`);
+          assert.deepEqual(await res.json(), GUEST, `${label} must fall back to guest`);
+        }, { platformIdentityUrl: stub ? stub.url : options.platformIdentityUrl, fetchImpl: stub ? stub.fetch : options.fetchImpl, ...options });
+      });
+    }
+    assert.equal(dead.calls(), 0);
+  } finally {
+    for (const stub of [rejecting, denying, garbage, hanging]) await stub.close();
+  }
+});
+
+test('a visitor without the platform cookie is never sent to the platform', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 363 }));
+  try {
+    await withServer(async ({ base }) => {
+      const res = await fetch(`${base}/_gateway/me?app=demo`);
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), GUEST);
+      assert.equal(platform.attempts, 0, 'a real guest must not cost a network round trip');
+      assert.equal(platform.calls(), 0);
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('an empty platform identity URL switches the relay off', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 363 }));
+  try {
+    await withServer(async ({ base }) => {
+      const res = await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } });
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), GUEST);
+      assert.equal(platform.attempts, 0);
+    }, { platformIdentityUrl: '', fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('the platform cookie name is configurable and both settings are validated', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 363, expires_at: PLATFORM_EXPIRES }));
+  try {
+    await withServer(async ({ base }) => {
+      const renamed = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: 'catsco_alt=363.1758260000.sig' } })).json();
+      assert.equal(renamed.authenticated, true);
+      const ignored = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } })).json();
+      assert.deepEqual(ignored, GUEST, 'the default name is no longer read');
+    }, { platformIdentityUrl: platform.url, platformCookieName: 'catsco_alt', fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+
+  const plain = { config: CONFIG, store: new ViewerStore({ file: tmpState() }), controlToken: CONTROL_TOKEN };
+  for (const platformCookieName of ['', 'a b', 'a=b', '__Host-aid\n', 'x'.repeat(65), 42, null]) {
+    assert.throws(() => createControlPlane({ ...plain, platformCookieName }), `cookie name must be rejected: ${platformCookieName}`);
+  }
+  for (const platformIdentityUrl of ['http://app.catsco.cc/api/artifacts/identity', 'https://', 'https://app.catsco.cc', 'https://app.catsco.cc/x?y=1', 'https://app.catsco.cc/%2e%2e/x', 42]) {
+    assert.throws(() => createControlPlane({ ...plain, platformIdentityUrl }), `identity URL must be rejected: ${platformIdentityUrl}`);
+  }
+  assert.ok(createControlPlane({ ...plain, platformIdentityUrl: '' }), 'an empty URL is the documented off switch');
 });
