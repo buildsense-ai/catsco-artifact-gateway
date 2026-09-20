@@ -8,6 +8,12 @@ import fs from 'node:fs';
 import { appId, COOKIE_NAME, isToken, ViewerStore, VIEWER_CONTRACT } from './viewer-store.mjs';
 import { cookieName, httpsUrl } from './config.mjs';
 
+// Default platform handshake page. It must be the file the platform actually
+// serves: the single-page app owns every extension-less path, so a bare
+// `/artifact-auth` renders the app itself and the whole exchange silently
+// becomes a no-op. The path-derived guard test below pins this.
+export const DEFAULT_HANDSHAKE_URL = 'https://app.catsco.cc/artifact-auth.html';
+
 const MAX_BODY = 8 * 1024;
 const PLATFORM_IDENTITY_URL = 'https://app.catsco.cc/api/artifacts/identity';
 const PLATFORM_COOKIE_NAME = 'catsco_artifact_id';
@@ -126,7 +132,9 @@ async function verifyPlatformIdentity({ url, name, value, controlToken, timeoutM
     if (typeof uid !== 'string' || uid === '') return null;
     return { uid, expiresAt: typeof body.expires_at === 'string' ? body.expires_at : null };
   } catch (error) {
-    logger?.error?.(JSON.stringify({ event: 'platform_identity_check_failed', reason: error?.name === 'AbortError' ? 'timeout' : 'error', message: error?.message }));
+    // Deliberately no error.message: a transport error can quote the request
+    // headers, and one of them is the visitor's platform cookie.
+    logger?.error?.(JSON.stringify({ event: 'platform_identity_check_failed', reason: error?.name === 'AbortError' ? 'timeout' : 'error' }));
     return null;
   } finally {
     clearTimeout(timer);
@@ -208,7 +216,7 @@ export function createControlPlane({
   cookieSecure = true,
   configUpdatedAt = null,
   logger = console,
-  handshakeUrl = 'https://app.catsco.cc/artifact-auth',
+  handshakeUrl = DEFAULT_HANDSHAKE_URL,
   platformIdentityUrl = PLATFORM_IDENTITY_URL,
   platformCookieName = PLATFORM_COOKIE_NAME,
   platformIdentityTimeoutMs = PLATFORM_TIMEOUT_MS,

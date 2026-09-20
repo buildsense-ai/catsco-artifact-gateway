@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, buildAppList, safeNext, handshakeTarget } from '../src/control-plane.mjs';
+import { createControlPlane, buildAppList, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -271,6 +271,16 @@ test('return paths stay inside the requesting application', () => {
   ]) assert.equal(safeNext(hostile, 'demo'), '/demo/', `must be rejected: ${hostile}`);
 });
 
+test('the default handshake page is the file the platform actually serves', () => {
+  // The platform's single-page app owns every extension-less path, so a bare
+  // `/artifact-auth` renders the app itself and the exchange silently becomes a
+  // no-op. This guard keeps the default on the real file, and keeps the
+  // validator able to accept it.
+  assert.equal(DEFAULT_HANDSHAKE_URL, 'https://app.catsco.cc/artifact-auth.html');
+  const target = new URL(handshakeTarget(DEFAULT_HANDSHAKE_URL, 'demo', '/demo/', 'https://artifact.catsco.cc'));
+  assert.equal(target.pathname, '/artifact-auth.html');
+});
+
 test('handshake target carries the application, the return path and the gateway origin', () => {
   const target = new URL(handshakeTarget('https://app.example.cc/artifact-auth', 'demo', '/demo/page.html', 'https://artifact.example.cn'));
   assert.equal(target.origin, 'https://app.example.cc');
@@ -286,7 +296,7 @@ test('an application without a credential is sent to the platform handshake', as
     assert.equal(res.status, 302);
     const location = new URL(res.headers.get('location'));
     assert.equal(location.origin, 'https://app.catsco.cc');
-    assert.equal(location.pathname, '/artifact-auth');
+    assert.equal(location.pathname, '/artifact-auth.html');
     assert.equal(location.searchParams.get('app'), 'demo');
     assert.equal(location.searchParams.get('next'), '/demo/index.html');
 

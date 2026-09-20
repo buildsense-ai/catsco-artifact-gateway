@@ -146,7 +146,9 @@ Environment for `deploy/control-plane.service` (`/etc/catsco-artifact-gateway/co
 | `CAG_CONTROL_TOKEN` | shared secret for `POST /_gateway/codes`; at least 32 chars |
 | `CAG_STATE_FILE` | viewer state, defaults to `/var/lib/catsco-artifact-gateway/viewer-state.json` |
 | `CAG_CORS_ORIGINS` | comma-separated origins allowed to read `/api/apps` |
-| `CAG_HANDSHAKE_URL` | platform handshake page for `/_auth/start`; defaults to `https://app.catsco.cc/artifact-auth`, can also come from `handshakeUrl` in `gateway.json` |
+| `CAG_HANDSHAKE_URL` | platform handshake page for `/_auth/start`; defaults to `https://app.catsco.cc/artifact-auth.html` (a real file: the platform's single-page app owns extension-less paths), can also come from `handshakeUrl` in `gateway.json` |
+| `CAG_PLATFORM_IDENTITY_URL` | platform's read-only identity lookup used when no gateway session exists, e.g. `https://app.catsco.cc/api/artifacts/identity`; **an empty string switches the silent path off** |
+| `CAG_PLATFORM_COOKIE_NAME` | name of the platform domain cookie to relay, default `catsco_artifact_id` |
 | `CAG_CODE_TTL_SECONDS` / `CAG_SESSION_TTL_SECONDS` | 60 / 2592000 by default |
 | `CAG_COOKIE_INSECURE` | test only: drop `Secure` for plain-HTTP local runs |
 

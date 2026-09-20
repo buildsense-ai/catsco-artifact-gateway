@@ -26,7 +26,11 @@ export function appTitle(value) {
 // query, fragment or credentials. Shared by every URL the control plane calls
 // out to, so one integration cannot quietly weaken the rule for another.
 export function httpsUrl(value, field = 'URL') {
-  if (typeof value !== 'string' || !/^https:\/\/[a-zA-Z0-9.-]+\/[a-zA-Z0-9/_-]+$/.test(value)) throw new Error(`Invalid ${field}`);
+  // The path may contain a dot: the platform handshake page is a real file
+  // (`artifact-auth.html`), because the platform's single-page app owns every
+  // extension-less path. Rejecting the dot here would make the correct value
+  // impossible to configure and abort startup.
+  if (typeof value !== 'string' || !/^https:\/\/[a-zA-Z0-9.-]+\/[a-zA-Z0-9/_.-]+$/.test(value)) throw new Error(`Invalid ${field}`);
   return value;
 }
 // A cookie name is copied into an outbound request header, so it stays inside
