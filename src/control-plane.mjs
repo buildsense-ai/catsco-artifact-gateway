@@ -6,8 +6,15 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import { appId, COOKIE_NAME, isToken, ViewerStore, VIEWER_CONTRACT } from './viewer-store.mjs';
+import { cookieName, httpsUrl } from './config.mjs';
 
 const MAX_BODY = 8 * 1024;
+const PLATFORM_IDENTITY_URL = 'https://app.catsco.cc/api/artifacts/identity';
+const PLATFORM_COOKIE_NAME = 'catsco_artifact_id';
+const PLATFORM_TIMEOUT_MS = 3000;
+// A platform cookie is an opaque `<uid:exp.hmac>` blob; this is a sanity bound,
+// not a parse. The gateway never reads a field out of it.
+const MAX_PLATFORM_COOKIE = 4096;
 
 function json(res, status, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
@@ -83,6 +90,49 @@ function cookieToken(req) {
   return isToken(token) ? token : null;
 }
 
+// The platform domain cookie (Domain=.catsco.cc) is the silent path: the browser
+// sends it to the application host too, so the gateway can identify a visitor
+// without a one-shot code ever being minted. Its value is opaque here.
+function platformCookieValue(req, name) {
+  const value = parseCookies(req.headers.cookie)[name];
+  if (typeof value !== 'string' || value === '' || value.length > MAX_PLATFORM_COOKIE) return null;
+  if (/[\r\n\0]/.test(value)) return null;
+  return value;
+}
+
+// Ask the platform whether a domain cookie still identifies a signed-in user.
+// Returns { uid, expiresAt } only when the platform vouches for it. Every other
+// outcome (rejection, transport error, timeout, unreadable body) is a refusal,
+// because the caller's only remaining option is the guest record: a broken or
+// slow platform must never turn into a failed request.
+async function verifyPlatformIdentity({ url, name, value, controlToken, timeoutMs, fetchImpl = globalThis.fetch, logger = null }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      headers: {
+        Cookie: `${name}=${value}`,
+        Authorization: `Bearer ${controlToken}`,
+        Accept: 'application/json',
+      },
+      signal: controller.signal,
+      redirect: 'error',
+    });
+    if (res.status !== 200) return null;
+    const body = await res.json();
+    if (!body || body.authenticated !== true) return null;
+    const uid = typeof body.uid === 'number' ? String(body.uid) : body.uid;
+    if (typeof uid !== 'string' || uid === '') return null;
+    return { uid, expiresAt: typeof body.expires_at === 'string' ? body.expires_at : null };
+  } catch (error) {
+    logger?.error?.(JSON.stringify({ event: 'platform_identity_check_failed', reason: error?.name === 'AbortError' ? 'timeout' : 'error', message: error?.message }));
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // The automatic identity attempt lands back on the application. Only paths
 // inside the application that started it are allowed, so the handshake cannot
 // be turned into an open redirect.
@@ -150,12 +200,58 @@ function agentRef(value) {
   return value;
 }
 
-export function createControlPlane({ config, store, controlToken, corsOrigins = [], cookieSecure = true, configUpdatedAt = null, logger = console, handshakeUrl = 'https://app.catsco.cc/artifact-auth' }) {
+export function createControlPlane({
+  config,
+  store,
+  controlToken,
+  corsOrigins = [],
+  cookieSecure = true,
+  configUpdatedAt = null,
+  logger = console,
+  handshakeUrl = 'https://app.catsco.cc/artifact-auth',
+  platformIdentityUrl = PLATFORM_IDENTITY_URL,
+  platformCookieName = PLATFORM_COOKIE_NAME,
+  platformIdentityTimeoutMs = PLATFORM_TIMEOUT_MS,
+  fetchImpl = globalThis.fetch,
+}) {
   if (!controlToken || controlToken.length < 32) throw new Error('Control token must be at least 32 characters');
   if (!store) throw new Error('Viewer store is required');
-  if (!/^https:\/\/[a-zA-Z0-9.-]+\/[a-zA-Z0-9/_-]+$/.test(handshakeUrl)) throw new Error('Invalid handshake URL');
+  httpsUrl(handshakeUrl, 'handshake URL');
+  // An empty URL switches the platform relay off: the gateway then behaves
+  // exactly as it did before the path existed.
+  const platformUrl = platformIdentityUrl ? httpsUrl(platformIdentityUrl, 'platform identity URL') : null;
+  const platformName = cookieName(platformCookieName);
   const hosts = [...config.publicHosts];
   const known = new Set((config.apps || []).map(app => app.id));
+
+  // The silent path: a platform-signed visitor becomes a user record, with the
+  // same pseudonym the one-shot code path mints for the same uid. There is no
+  // session context behind a domain cookie, so the topic stays null.
+  async function platformViewer(app, req) {
+    if (!platformUrl) return null;
+    const value = platformCookieValue(req, platformName);
+    if (!value) return null;
+    const identity = await verifyPlatformIdentity({
+      url: platformUrl,
+      name: platformName,
+      value,
+      controlToken,
+      timeoutMs: platformIdentityTimeoutMs,
+      fetchImpl,
+      logger,
+    });
+    if (!identity) return null;
+    let id;
+    try { id = store.pseudonymFor(app, identity.uid); } catch { return null; }
+    return {
+      contract: VIEWER_CONTRACT,
+      authenticated: true,
+      viewer: { id, kind: 'user' },
+      app_id: app,
+      topic_id: null,
+      expires_at: identity.expiresAt,
+    };
+  }
 
   function corsHeaders(req) {
     const origin = req.headers.origin;
@@ -264,18 +360,23 @@ export function createControlPlane({ config, store, controlToken, corsOrigins = 
         return res.end(page);
       }
 
-      // Single identity output. A missing credential means guest; a present but
-      // invalid credential is an error, so an application can re-launch instead
-      // of silently degrading a signed-in user to guest.
+      // Single identity output. A gateway session wins and is resolved exactly
+      // as before. Without one, a platform domain cookie is the silent path; if
+      // it cannot vouch for the visitor this is still a plain guest answer. Only
+      // a credential the gateway did issue, but which no longer resolves, is an
+      // error, so an application can re-launch instead of silently degrading a
+      // signed-in user to guest.
       if (path === '/_gateway/me') {
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         const app = appFromRequest(req, url);
         if (!app || !known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const token = cookieToken(req) || bearerToken(req);
-        if (!token) return json(res, 200, store.guestRecord(app));
-        const viewer = store.viewerRecord(token, app);
-        if (!viewer) return json(res, 401, { contract: VIEWER_CONTRACT, error: 'invalid_or_expired', app_id: app });
-        return json(res, 200, viewer);
+        if (token) {
+          const viewer = store.viewerRecord(token, app);
+          if (!viewer) return json(res, 401, { contract: VIEWER_CONTRACT, error: 'invalid_or_expired', app_id: app });
+          return json(res, 200, viewer);
+        }
+        return json(res, 200, (await platformViewer(app, req)) || store.guestRecord(app));
       }
 
       return json(res, 404, { error: 'not_found' });
@@ -312,6 +413,8 @@ export function loadControlPlaneFromEnv({ configPath, env = process.env, logger 
       cookieSecure: env.CAG_COOKIE_INSECURE !== '1',
       configUpdatedAt,
       handshakeUrl: env.CAG_HANDSHAKE_URL || config.handshakeUrl || undefined,
+      platformIdentityUrl: env.CAG_PLATFORM_IDENTITY_URL ?? PLATFORM_IDENTITY_URL,
+      platformCookieName: env.CAG_PLATFORM_COOKIE_NAME || PLATFORM_COOKIE_NAME,
       logger,
     }),
   };
