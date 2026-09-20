@@ -58,8 +58,13 @@ async function loadIdentity(){
   try {
     // Relative on purpose: the application is served under /<app-id>/, so an
     // absolute '/api/...' would leave the application and hit the gateway root.
-    var me = await (await fetch('api/whoami', { cache: 'no-store' })).json();
-    if (!me) { setIdentity('未检测到身份', '网关没有返回内容'); show('identity-confirm', true); return; }
+    var res = await fetch('api/whoami', { cache: 'no-store' });
+    // A gateway fault answers with JSON as well, so an error body must not be
+    // read as "no credentials": that would tell a signed-in visitor they are a
+    // guest, which is both wrong and the opposite of reassuring.
+    if (!res.ok) throw new Error('身份服务返回 ' + res.status);
+    var me = await res.json();
+    if (!me || me.error) throw new Error(String((me && me.error) || '身份服务返回空内容'));
     if (me.authenticated) {
       setIdentity('已确认身份' + (framed ? '（侧栏内）' : ''), '');
       el('identity-detail').textContent = '使用者 ' + me.viewer.id + '（' + me.viewer.kind + '） · 应用 ' + me.app_id
