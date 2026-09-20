@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, buildAppList, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createControlPlane, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -36,6 +36,7 @@ async function withServer(fn, options = {}) {
     cookieSecure: false,
     corsOrigins: ['https://app.example.cc'],
     handshakeUrl: options.handshakeUrl,
+    handshakeUrls: options.handshakeUrls,
     platformIdentityUrl: options.platformIdentityUrl,
     platformCookieName: options.platformCookieName,
     platformIdentityTimeoutMs: options.platformIdentityTimeoutMs,
@@ -504,3 +505,145 @@ test('the platform cookie name is configurable and both settings are validated',
   }
   assert.ok(createControlPlane({ ...plain, platformIdentityUrl: '' }), 'an empty URL is the documented off switch');
 });
+
+// --- One site per visitor ----------------------------------------------------
+//
+// The platform and the gateway each answer on two registrable domains. A visitor
+// signed in on one of them must be handed a URL on the same one, because the
+// cookies that carry the identity are Lax and scoped to that site. Getting this
+// wrong does not fail loudly: the other domain serves the very same application
+// and simply shows the visitor as a guest.
+
+// fetch() will not let a test choose the Host header, and the Host is exactly
+// what this decision reads, so this one request is made with the raw client.
+function requestWithHost(base, path, host) {
+  const url = new URL(base + path);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ hostname: url.hostname, port: url.port, path: url.pathname + url.search, headers: { Host: host } }, res => {
+      res.resume();
+      resolve({ status: res.statusCode, location: res.headers.location });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('the launch URL stays on the domain the caller is signed in to', () => {
+  const hosts = CONFIG.publicHosts;
+  assert.equal(matchBySuffix(hosts, 'app.example.cc'), 'artifact.example.cc');
+  assert.equal(matchBySuffix(hosts, 'app.example.cn'), 'artifact.example.cn');
+  assert.equal(matchBySuffix(hosts, 'app.example.cn:8443'), 'artifact.example.cn', 'a port is not part of the site');
+  assert.equal(matchBySuffix(hosts, 'APP.EXAMPLE.CN'), 'artifact.example.cn', 'hostnames are case insensitive');
+  // A hint that names no configured site falls back to the first host. An older
+  // platform sends no hint at all, and the fallback must never echo the hint
+  // back: that would let the caller choose the domain.
+  for (const hint of ['', undefined, null, 'evil.example', 'app.example.com', 'app.catsco.cn', 'not a host', '127.0.0.1', 'x'.repeat(300)]) {
+    assert.equal(matchBySuffix(hosts, hint), 'artifact.example.cc', `unexpected choice for ${JSON.stringify(hint)}`);
+  }
+  assert.equal(matchBySuffix([], 'app.example.cn'), null);
+});
+
+test('code issuance puts the launch URL on the caller own domain', async () => {
+  await withServer(async ({ base }) => {
+    const cn = await issue(base, { app: 'demo', uid: '441', host: 'app.example.cn' });
+    assert.equal(cn.status, 201);
+    assert.match(cn.body.launch_url, /^https:\/\/artifact\.example\.cn\/_launch\/[A-Za-z0-9_-]{32,}\?next=\/demo\/$/);
+
+    const cc = await issue(base, { app: 'demo', uid: '441', host: 'app.example.cc' });
+    assert.match(cc.body.launch_url, /^https:\/\/artifact\.example\.cc\/_launch\//);
+
+    const noHint = await issue(base, { app: 'demo', uid: '441' });
+    assert.match(noHint.body.launch_url, /^https:\/\/artifact\.example\.cc\/_launch\//, 'the first host stays the default');
+
+    const hostile = await issue(base, { app: 'demo', uid: '441', host: 'evil.example' });
+    assert.match(hostile.body.launch_url, /^https:\/\/artifact\.example\.cc\/_launch\//, 'a hint can only select a configured host');
+  });
+});
+
+test('the handshake page follows the domain the browser is on', async () => {
+  const handshakeUrls = ['https://app.example.cc/artifact-auth.html', 'https://app.example.cn/artifact-auth.html'];
+  await withServer(async ({ base }) => {
+    const at = async host => new URL((await requestWithHost(base, '/_auth/start?app=demo', host)).location);
+    assert.equal((await at('artifact.example.cn')).origin, 'https://app.example.cn');
+    assert.equal((await at('artifact.example.cc')).origin, 'https://app.example.cc');
+    assert.equal((await at('unknown.example.com')).origin, 'https://app.example.cc', 'an unknown host gets the default page');
+    assert.equal((await at('artifact.example.cn')).searchParams.get('gw'), 'https://artifact.example.cn', 'the exchange returns to the same gateway domain');
+  }, { handshakeUrls });
+});
+
+// --- Identity fields ---------------------------------------------------------
+
+test('both entry paths publish the platform uid and the account name', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 441, username: 'john.doe', expires_at: PLATFORM_EXPIRES }));
+  try {
+    await withServer(async ({ base }) => {
+      const silent = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } })).json();
+      assert.equal(silent.viewer.uid, 441);
+      assert.equal(silent.viewer.username, 'john.doe');
+
+      const { body } = await issue(base, { app: 'demo', uid: '441', username: 'john.doe', topic: 't1' });
+      const token = (await (await fetch(`${base}/_launch/${body.code}?format=json`)).json()).token;
+      const coded = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: `${COOKIE_NAME}=${token}` } })).json();
+      assert.equal(coded.viewer.uid, 441);
+      assert.equal(coded.viewer.username, 'john.doe');
+      assert.equal(coded.viewer.id, silent.viewer.id, 'both entries still agree on the pseudonym');
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('a missing or non-numeric identity publishes null instead of a guess', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 441, expires_at: PLATFORM_EXPIRES }));
+  try {
+    await withServer(async ({ base }) => {
+      const silent = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } })).json();
+      assert.ok('username' in silent.viewer, 'the field is part of the shape, not optional by omission');
+      assert.equal(silent.viewer.username, null, 'a platform that sends no name must not break the exchange');
+      assert.equal(silent.viewer.uid, 441);
+
+      const { body } = await issue(base, { app: 'demo', uid: 'u1', username: 'saturday' });
+      const token = (await (await fetch(`${base}/_launch/${body.code}?format=json`)).json()).token;
+      const viewer = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: `${COOKIE_NAME}=${token}` } })).json();
+      assert.equal(viewer.viewer.uid, null, 'a subject that is not a number publishes null');
+      assert.equal(viewer.viewer.username, 'saturday');
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('a platform uid of the wrong shape is refused, not minted into a viewer', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 'u1', expires_at: PLATFORM_EXPIRES }));
+  try {
+    await withServer(async ({ base }) => {
+      const viewer = await (await fetch(`${base}/_gateway/me?app=demo`, { headers: { Cookie: PLATFORM_COOKIE } })).json();
+      assert.deepEqual(viewer, GUEST, 'the platform is the only authority on the shape of its own uid');
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
+test('a session minted before the account name existed still answers', () => {
+  const store = new ViewerStore({ file: tmpState(), now: () => 1_700_000_000_000 });
+  const session = store.redeemCode(store.issueCode({ app: 'demo', uid: '441' }).code);
+  // A record written by the previous release carries only the pseudonym.
+  delete store.state.sessions[session.token].uid;
+  delete store.state.sessions[session.token].username;
+  const viewer = store.viewerRecord(session.token, 'demo');
+  assert.equal(viewer.authenticated, true);
+  assert.match(viewer.viewer.id, /^ap_[A-Za-z0-9_-]{22}$/);
+  assert.equal(viewer.viewer.uid, null);
+  assert.equal(viewer.viewer.username, null);
+  assert.equal(viewer.topic_id, null);
+});
+
+test('a handshake list is validated like every other outbound URL', () => {
+  const plain = { config: CONFIG, store: new ViewerStore({ file: tmpState() }), controlToken: CONTROL_TOKEN };
+  for (const handshakeUrls of [['http://app.example.cc/artifact-auth.html'], ['https://app.example.cc'], ['https://app.example.cc/x?y=1'], [42]]) {
+    assert.throws(() => createControlPlane({ ...plain, handshakeUrls }), `handshake list must be rejected: ${handshakeUrls}`);
+  }
+  assert.ok(createControlPlane({ ...plain, handshakeUrls: [] }), 'an empty list falls back to the single handshake URL');
+});
+
