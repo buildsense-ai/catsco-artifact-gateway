@@ -67,7 +67,13 @@ async function loadIdentity(){
     if (!me || me.error) throw new Error(String((me && me.error) || '身份服务返回空内容'));
     if (me.authenticated) {
       setIdentity('已确认身份' + (framed ? '（侧栏内）' : ''), '');
-      el('identity-detail').textContent = '使用者 ' + me.viewer.id + '（' + me.viewer.kind + '） · 应用 ' + me.app_id
+      // The account name and uid are what an application anchors its own rows
+      // to; the pseudonym is only its local key. Either can be absent — an old
+      // platform cookie carries no name, and a non-numeric subject publishes no
+      // uid — so both are printed as "未知" rather than dropped.
+      var account = (me.viewer.username ? me.viewer.username : '未知账号')
+        + '（uid ' + (me.viewer.uid === null || me.viewer.uid === undefined ? '未知' : me.viewer.uid) + '）';
+      el('identity-detail').textContent = '账号 ' + account + ' · 本应用内标识 ' + me.viewer.id + '（' + me.viewer.kind + '） · 应用 ' + me.app_id
         + (me.topic_id ? ' · 来自会话 ' + me.topic_id : ' · 无会话（直接打开网址）')
         + ' · 有效期至 ' + me.expires_at;
       show('identity-guest', false); show('identity-confirm', false); return;
