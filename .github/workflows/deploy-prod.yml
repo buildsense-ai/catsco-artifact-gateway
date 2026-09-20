@@ -1,0 +1,96 @@
+name: Deploy Artifact Gateway
+
+# The gateway is not a container: it is source files, one root helper and two
+# systemd units on the gateway host. Deploying therefore means "copy the source,
+# make sure the units are installed and current, apply the config, restart the
+# control plane" — and it has to be idempotent, because it also runs on every
+# later merge. That is what makes publishing self-service: nobody has to log in
+# to the gateway host to install or update it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cag-deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      GATEWAY_ROOT: /opt/catsco-artifact-gateway
+      UNIT: catsco-artifact-gateway-control-plane
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<EOF
+          Host cag
+            HostName ${{ secrets.SSH_HOST }}
+            User ${{ secrets.SSH_USER }}
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            ServerAliveInterval 15
+            ServerAliveCountMax 40
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Upload the source
+        run: |
+          tar -czf - src scripts deploy docs package.json package-lock.json README.md \
+            | ssh cag "sudo -n tar -xzf - -C $GATEWAY_ROOT && sudo -n chown -R root:root $GATEWAY_ROOT/src $GATEWAY_ROOT/scripts $GATEWAY_ROOT/deploy $GATEWAY_ROOT/docs $GATEWAY_ROOT/package.json $GATEWAY_ROOT/package-lock.json $GATEWAY_ROOT/README.md"
+
+      - name: Ensure the runtime dependency is present
+        # The control plane is a plain node process; `ws` is its only dependency
+        # and it is already installed on the host. Failing loudly here is better
+        # than deploying a process that cannot load.
+        run: ssh cag "test -d $GATEWAY_ROOT/node_modules/ws || { echo 'missing node_modules/ws — run npm ci in $GATEWAY_ROOT on the gateway host'; exit 1; }"
+
+      - name: Install or refresh the units
+        # Everything here is idempotent: the root helper, the path unit that
+        # watches gateway.json, and the control-plane unit itself (which needs
+        # ReadWritePaths, or the registration API cannot write its own config).
+        run: |
+          ssh cag "set -e
+            sudo -n chmod 755 $GATEWAY_ROOT/deploy/apply-config.sh
+            sudo -n install -m 644 $GATEWAY_ROOT/deploy/cag-apply.service $GATEWAY_ROOT/deploy/cag-apply.path /etc/systemd/system/
+            sudo -n install -m 644 $GATEWAY_ROOT/deploy/control-plane.service /etc/systemd/system/$UNIT.service
+            sudo -n systemctl daemon-reload
+            sudo -n systemctl enable --now cag-apply.path"
+
+      - name: Apply the current config
+        # Installing the watcher applies nothing by itself: it reacts to a change.
+        # The first deploy after this workflow exists therefore has to ask for one
+        # pass explicitly, so nginx picks up routes it has not seen before.
+        run: ssh cag "sudo -n systemctl start cag-apply.service"
+
+      - name: Restart the control plane
+        run: |
+          ssh cag "sudo -n systemctl restart $UNIT"
+          sleep 2
+          ssh cag "sudo -n systemctl is-active $UNIT"
+
+      - name: Verify
+        run: |
+          set -e
+          health=$(curl -fsS https://artifact.catsco.cc/_gateway/health)
+          echo "health: $health"
+          echo "$health" | grep -q '"ok":true'
+          # Registration is a platform-to-gateway call, so it must be reachable
+          # from outside on both public domains, and refuse an anonymous caller.
+          for host in artifact.catsco.cc artifact.catsco.cn; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://$host/_gateway/apps")
+            echo "$host /_gateway/apps -> $code"
+            test "$code" = "401"
+          done
