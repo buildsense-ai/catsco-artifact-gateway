@@ -196,6 +196,39 @@ test('a session minted for one application is refused for another sharing the or
   });
 });
 
+// The session cookie carries one application, but the browser holds one value
+// per gateway host: after visiting another application on the same origin, the
+// visitor presents a record this application cannot use. The platform domain
+// cookie still speaks for them, so that must not be answered as an error.
+test('an unusable session cookie still lets the platform cookie identify the visitor', async () => {
+  const platform = await platformStub(platformBody({ authenticated: true, uid: 363, expires_at: PLATFORM_EXPIRES }));
+  try {
+    await withServer(async ({ base, store }) => {
+      const foreign = await issueToken(base, 'u1'); // minted for `demo`
+      const res = await fetch(`${base}/_gateway/me?app=other`, {
+        headers: { Cookie: `${COOKIE_NAME}=${foreign}; ${PLATFORM_COOKIE}` },
+      });
+      assert.equal(res.status, 200, 'a session for another application is not a failed request');
+      const viewer = await res.json();
+      assert.equal(viewer.authenticated, true);
+      assert.equal(viewer.app_id, 'other');
+      assert.equal(viewer.topic_id, null, 'the platform path carries no session context');
+      assert.equal(viewer.viewer.uid, 363);
+      assert.equal(viewer.viewer.id, store.pseudonymFor('other', '363'));
+      assert.equal(platform.calls(), 1);
+      assert.equal(platform.seen[0].cookie, PLATFORM_COOKIE, 'the platform is asked about the domain cookie');
+
+      // Nothing vouches for the visitor: the present-but-unusable credential is
+      // still reported, so an application can re-launch instead of degrading.
+      const bare = await fetch(`${base}/_gateway/me?app=other`, { headers: { Cookie: `${COOKIE_NAME}=${foreign}` } });
+      assert.equal(bare.status, 401);
+      assert.equal(platform.calls(), 1, 'a request without a platform cookie must not reach the platform');
+    }, { platformIdentityUrl: platform.url, fetchImpl: platform.fetch });
+  } finally {
+    await platform.close();
+  }
+});
+
 test('identity resolves the application from the referring path', async () => {
   await withServer(async ({ base }) => {
     const { body } = await issue(base, { app: 'demo', uid: 'u7', topic: 't-9' });
