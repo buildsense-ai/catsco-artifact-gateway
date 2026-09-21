@@ -729,12 +729,18 @@ export function createControlPlane({
         const app = appFromRequest(req, url);
         if (!app || !current.known.has(app)) return json(res, 404, { error: 'unknown_app' });
         const token = cookieToken(req) || bearerToken(req);
-        if (token) {
-          const viewer = store.viewerRecord(token, app);
-          if (!viewer) return json(res, 401, { contract: VIEWER_CONTRACT, error: 'invalid_or_expired', app_id: app });
-          return json(res, 200, viewer);
-        }
-        return json(res, 200, (await platformViewer(app, req)) || store.guestRecord(app));
+        const session = token ? store.viewerRecord(token, app) : null;
+        if (session) return json(res, 200, session);
+        // The session cookie is one value for the whole gateway host, so a browser
+        // that visited another application first presents a record that does not
+        // belong to this one. That is not the same as a credential that expired,
+        // and it must not cost the visitor their identity: the platform domain
+        // cookie still speaks for them. Only when nothing can vouch for the
+        // visitor does a present-but-unusable credential stay an error.
+        const silent = await platformViewer(app, req);
+        if (silent) return json(res, 200, silent);
+        if (token) return json(res, 401, { contract: VIEWER_CONTRACT, error: 'invalid_or_expired', app_id: app });
+        return json(res, 200, store.guestRecord(app));
       }
 
       return json(res, 404, { error: 'not_found' });
