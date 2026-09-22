@@ -22,6 +22,26 @@ export function appTitle(value) {
   if (!trimmed || trimmed.length > 60 || /[\r\n\0]/.test(trimmed)) throw new Error('Invalid application title');
   return trimmed;
 }
+// A per-application ceiling on the request body the gateway will accept, written
+// in the syntax nginx itself uses so the rendered directive is the declared value
+// verbatim and no unit conversion can drift.
+//
+// The ceiling is enforced here rather than left to the caller because the gateway
+// host's disk and bandwidth are shared with the platform: nginx buffers a request
+// body before handing it over, so an application able to declare any size could
+// fill that disk a request at a time. A value above the ceiling is refused
+// instead of clamped, so a caller learns immediately that its declaration was not
+// honoured rather than discovering it on the first upload that no longer fits.
+const bodySizeUnits = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
+
+export function bodySize(value, ceilingBytes) {
+  const match = typeof value === 'string' ? /^([1-9][0-9]{0,9})([kKmMgG]?)$/.exec(value) : null;
+  if (!match) throw new Error('Invalid maxBody');
+  const unit = match[2].toLowerCase();
+  const bytes = Number(match[1]) * bodySizeUnits[unit];
+  if (!Number.isSafeInteger(bytes) || bytes > ceilingBytes) throw new Error('maxBody exceeds the gateway ceiling');
+  return value;
+}
 // Absolute https endpoint on a named host with a restricted path charset and no
 // query, fragment or credentials. Shared by every URL the control plane calls
 // out to, so one integration cannot quietly weaken the rule for another.
