@@ -84,7 +84,7 @@ node scripts/local-demo.mjs stop /absolute/user/state/connector.json
 2. 不包含新 Artifact 列表 UI 或旧 Artifact 删除。旧系统保持运行。
 3. 目前管理员登记应用，尚不是自助一键发布 API。
 4. 独立双域名 `artifact.catsco.cc`、`artifact.catsco.cn` 使用 `/<app-id>/` 路径；两个域名无强制跳转，均可访问全部应用。**不是多应用浏览器安全隔离方案**：共享 origin 的 localStorage 等仍共享。只部署本仓库可信、可丢弃 demo；禁止上传任意 Agent 生成的页面。如需运行互不信任的应用，必须另行解决应用间浏览器隔离；路径本身不是隔离边界。
-5. P0 会剥离 Cookie/Set-Cookie，限制 CSP 和 1MB 请求体；不支持应用登录 Cookie。正式隔离域名完成后再定义这些策略。
+5. P0 会剥离 Cookie/Set-Cookie，并施加一套 CSP 响应头；请求体上限默认 1MB，应用可自行声明到 256MB。不支持应用登录 Cookie。正式隔离域名完成后再定义这些策略。
 6. SSH+WSS 会增加进程数与加密开销，尚未压力测试。每应用一个连接只是两机验证方案。
 7. 网络只需出站 443，但仍需允许 WebSocket；强制企业代理/拦截场景未验证。
 8. 公网 demo 计数器有意匿名可写，只用于测试，不存用户数据或凭据。

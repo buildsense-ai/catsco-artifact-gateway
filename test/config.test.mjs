@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sshArgs, validateConnector } from '../src/config.mjs';
-import { renderGateway } from '../src/gateway-config.mjs';
+import { renderGateway, defaultMaxBody } from '../src/gateway-config.mjs';
 const c = { appId: 'demo', user: 'cag', host: 'example.com', sshPort: 22443, remotePort: 28191, localPort: 20171, identityFile: '/key', knownHostsFile: '/known', statusFile: '/status' };
 const g = { sshPort: 22443, user: 'cag', publicHosts: ['artifact.example.cc', 'artifact.example.cn'], hostKey: '/etc/cag/key', authorizedKeys: '/etc/cag/keys', apps: [{ id: 'demo', remotePort: 28191, publicKey: 'ssh-ed25519 AAAATEST demo' }] };
 test('connector pins host and binds only loopback without a remote shell', () => {
@@ -25,6 +25,30 @@ test('gateway validates application ownership', () => {
   // Ownership is optional in the schema: an application without it renders, but
   // no bot-scoped caller will ever receive it.
   assert.ok(renderGateway({ ...g, apps: [{ ...g.apps[0] }] }).locations.includes('location ^~ /demo/'));
+});
+test('each application declares its own request body ceiling, bounded by the gateway', () => {
+  // Absent means the small default, so every application published before the
+  // field existed keeps the limit it was published under.
+  assert.ok(renderGateway(g).locations.includes(`client_max_body_size ${defaultMaxBody};`));
+  const declared = renderGateway({ ...g, apps: [{ ...g.apps[0], maxBody: '256m' }] }).locations;
+  assert.ok(declared.includes('client_max_body_size 256m;'));
+  assert.ok(!declared.includes(`client_max_body_size ${defaultMaxBody};`));
+  // The ceiling is the point of the field. nginx buffers a request body before
+  // handing it over, so an unbounded declaration is how one application fills the
+  // disk the gateway host shares with the platform.
+  for (const maxBody of ['257m', '1g', '0', '', '1m;', '1M ', '10000000000000', 1024, '1x', ' 1m', '1m\n', -1, null]) {
+    assert.throws(() => renderGateway({ ...g, apps: [{ ...g.apps[0], maxBody }] }), `must reject maxBody ${JSON.stringify(maxBody)}`);
+  }
+});
+test('the rendered CSP lets an application serve its own page', () => {
+  const line = renderGateway(g).locations.split('\n').find(l => l.includes('Content-Security-Policy'));
+  // Loading one's own script file, showing an image and running a worker is the
+  // ordinary case for a published application; a policy missing these directives
+  // blocks all three, which is how a working page turns into a blank one.
+  for (const directive of ["script-src 'self'", "style-src 'self'", "img-src 'self' data: blob:", "font-src 'self' data:", "worker-src 'self' blob:", 'object-src']) assert.ok(line.includes(directive), directive);
+  // ...while the directives that keep a hosted page from escaping its own origin
+  // stay in place.
+  for (const directive of ["default-src 'none'", "base-uri 'none'", "form-action 'none'"]) assert.ok(line.includes(directive), directive);
 });
 test('WSS wrapper preserves SSH pinning and rejects proxy command injection', () => {
   const args = sshArgs({ ...c, transportUrl: 'wss://artifact.example.cc/_gateway/tunnel' });

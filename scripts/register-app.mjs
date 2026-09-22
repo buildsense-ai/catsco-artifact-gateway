@@ -53,12 +53,19 @@ const registration = JSON.parse(fs.readFileSync(path.resolve(second), 'utf8'));
 if (!registration.id || !registration.publicKey) throw new Error('Registration file needs at least id and publicKey');
 if (registration.agent === undefined) throw new Error('Registration file declares no owner: the application would appear in no bot\'s sidebar');
 
+const previous = (config.apps || []).find(app => app.id === registration.id);
 const entry = {
   id: registration.id,
   title: registration.title ?? registration.id,
   agent: String(registration.agent),
   remotePort: Number(registration.remotePort),
   publicKey: String(registration.publicKey).trim(),
+  // Same rule the API applies: a registration that does not declare a body
+  // ceiling keeps the stored one, so re-running this to rotate a key cannot
+  // silently shrink the uploads the application already accepts. Writing the
+  // field is what makes the ceiling survive the next apply, which re-renders
+  // the nginx include from this file.
+  maxBody: registration.maxBody ?? previous?.maxBody,
 };
 const others = (config.apps || []).filter(app => app.id !== entry.id);
 if (others.some(app => app.remotePort === entry.remotePort)) throw new Error(`Port ${entry.remotePort} is already registered`);

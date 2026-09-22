@@ -499,6 +499,12 @@ export function createControlPlane({
       // would turn every rename into a key rotation — and a rotation breaks the
       // connector that is already connected.
       publicKey: text(body.publicKey) ?? previous?.publicKey,
+      // Same rule as the title and the key: a caller that does not declare a
+      // request body ceiling keeps the registered one, so renaming an application
+      // cannot silently shrink the uploads it already accepts. The renderer bounds
+      // the value, so a declaration above the ceiling is refused as an invalid
+      // registration instead of being stored.
+      maxBody: text(body.maxBody) ?? previous?.maxBody,
     };
     // Same rule as the title: an update that does not send a local port keeps
     // the recorded one, so rotating a key cannot erase what the connector was
