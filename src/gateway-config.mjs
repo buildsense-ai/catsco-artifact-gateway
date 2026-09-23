@@ -1,11 +1,15 @@
 import { appTitle, bodySize, botUid, name, port } from './config.mjs';
 
 // What an application may declare for its own request body, and what one that
-// declares nothing keeps. Most applications are pages, so the default stays
-// small and the ones that accept uploads say so explicitly; the ceiling exists
-// because the gateway host's disk is shared with the platform (see bodySize).
+// declares nothing gets. The default is deliberately not tiny: most published
+// applications accept some upload, and a default that rejects an ordinary image
+// pushes every publisher into declaring a value just to work — which is how the
+// limit came to be hand-edited on the gateway host in the first place. An
+// application that wants a different value declares one; the ceiling below still
+// bounds what any single application can ask for, because the gateway host's
+// disk is shared with the platform (see bodySize).
 export const maxBodyCeilingBytes = 256 * 1024 ** 2;
-export const defaultMaxBody = '1m';
+export const defaultMaxBody = '64m';
 
 // P0 only: trusted disposable demos, not arbitrary untrusted HTML hosting.
 export function renderGateway(c) {

@@ -27,9 +27,13 @@ test('gateway validates application ownership', () => {
   assert.ok(renderGateway({ ...g, apps: [{ ...g.apps[0] }] }).locations.includes('location ^~ /demo/'));
 });
 test('each application declares its own request body ceiling, bounded by the gateway', () => {
-  // Absent means the small default, so every application published before the
-  // field existed keeps the limit it was published under.
+  // Absent means the shared default. It has to clear an ordinary upload: a default
+  // small enough to reject a normal image makes every publisher declare a value
+  // just to work, which is how this limit came to be edited by hand on the host.
   assert.ok(renderGateway(g).locations.includes(`client_max_body_size ${defaultMaxBody};`));
+  const defaultBytes = Number(defaultMaxBody.replace(/[a-z]/i, '')) * ({ k: 1024, m: 1024 ** 2 }[defaultMaxBody.slice(-1).toLowerCase()] ?? 1);
+  assert.ok(defaultBytes >= 16 * 1024 ** 2, `the default (${defaultMaxBody}) must fit an ordinary upload`);
+  assert.ok(defaultBytes <= 256 * 1024 ** 2, `the default (${defaultMaxBody}) must stay within the ceiling`);
   const declared = renderGateway({ ...g, apps: [{ ...g.apps[0], maxBody: '256m' }] }).locations;
   assert.ok(declared.includes('client_max_body_size 256m;'));
   assert.ok(!declared.includes(`client_max_body_size ${defaultMaxBody};`));
