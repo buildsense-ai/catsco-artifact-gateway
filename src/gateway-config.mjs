@@ -1,4 +1,4 @@
-import { appTitle, bodySize, botUid, name, port } from './config.mjs';
+import { appTitle, bodySizeBytes, botUid, name, port } from './config.mjs';
 
 // What an application may declare for its own request body, and what one that
 // declares nothing gets. The default is deliberately not tiny: most published
@@ -10,6 +10,13 @@ import { appTitle, bodySize, botUid, name, port } from './config.mjs';
 // disk is shared with the platform (see bodySize).
 export const maxBodyCeilingBytes = 256 * 1024 ** 2;
 export const defaultMaxBody = '64m';
+// The default is checked against the ceiling too. Only a declared `a.maxBody`
+// used to pass through the validator, so lowering the ceiling below the default
+// would have rendered a value that silently exceeded it: every application that
+// declared nothing would keep the old, larger limit while the ceiling claimed
+// otherwise. Failing at load makes that combination impossible to deploy, and it
+// rejects a default written with a unit the parser does not understand.
+bodySizeBytes(defaultMaxBody, maxBodyCeilingBytes);
 
 // P0 only: trusted disposable demos, not arbitrary untrusted HTML hosting.
 export function renderGateway(c) {
@@ -26,7 +33,7 @@ export function renderGateway(c) {
     ids.add(a.id); ports.add(a.remotePort);
     if (a.agent !== undefined) botUid(a.agent);
     if (a.title !== undefined) appTitle(a.title);
-    if (a.maxBody !== undefined) bodySize(a.maxBody, maxBodyCeilingBytes);
+    if (a.maxBody !== undefined) bodySizeBytes(a.maxBody, maxBodyCeilingBytes);
     if (!/^ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?$/.test(a.publicKey)) throw new Error('Expected ed25519 public key');
     const key = a.publicKey.split(' ')[1];
     if (keys.has(key)) throw new Error('Each application must use a distinct key');

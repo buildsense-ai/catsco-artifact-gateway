@@ -34,12 +34,19 @@ export function appTitle(value) {
 // honoured rather than discovering it on the first upload that no longer fits.
 const bodySizeUnits = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
 
-export function bodySize(value, ceilingBytes) {
+// The one place a size string becomes bytes, so a caller that needs to compare
+// two sizes does not re-implement the unit table (and get an unknown unit wrong).
+export function bodySizeBytes(value, ceilingBytes) {
   const match = typeof value === 'string' ? /^([1-9][0-9]{0,9})([kKmMgG]?)$/.exec(value) : null;
   if (!match) throw new Error('Invalid maxBody');
   const unit = match[2].toLowerCase();
   const bytes = Number(match[1]) * bodySizeUnits[unit];
   if (!Number.isSafeInteger(bytes) || bytes > ceilingBytes) throw new Error('maxBody exceeds the gateway ceiling');
+  return bytes;
+}
+
+export function bodySize(value, ceilingBytes) {
+  bodySizeBytes(value, ceilingBytes);
   return value;
 }
 // Absolute https endpoint on a named host with a restricted path charset and no

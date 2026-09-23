@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { sshArgs, validateConnector } from '../src/config.mjs';
-import { renderGateway, defaultMaxBody } from '../src/gateway-config.mjs';
+import { sshArgs, validateConnector, bodySizeBytes } from '../src/config.mjs';
+import { renderGateway, defaultMaxBody, maxBodyCeilingBytes } from '../src/gateway-config.mjs';
 const c = { appId: 'demo', user: 'cag', host: 'example.com', sshPort: 22443, remotePort: 28191, localPort: 20171, identityFile: '/key', knownHostsFile: '/known', statusFile: '/status' };
 const g = { sshPort: 22443, user: 'cag', publicHosts: ['artifact.example.cc', 'artifact.example.cn'], hostKey: '/etc/cag/key', authorizedKeys: '/etc/cag/keys', apps: [{ id: 'demo', remotePort: 28191, publicKey: 'ssh-ed25519 AAAATEST demo' }] };
 test('connector pins host and binds only loopback without a remote shell', () => {
@@ -31,9 +31,12 @@ test('each application declares its own request body ceiling, bounded by the gat
   // small enough to reject a normal image makes every publisher declare a value
   // just to work, which is how this limit came to be edited by hand on the host.
   assert.ok(renderGateway(g).locations.includes(`client_max_body_size ${defaultMaxBody};`));
-  const defaultBytes = Number(defaultMaxBody.replace(/[a-z]/i, '')) * ({ k: 1024, m: 1024 ** 2 }[defaultMaxBody.slice(-1).toLowerCase()] ?? 1);
+  const defaultBytes = bodySizeBytes(defaultMaxBody, maxBodyCeilingBytes);
   assert.ok(defaultBytes >= 16 * 1024 ** 2, `the default (${defaultMaxBody}) must fit an ordinary upload`);
-  assert.ok(defaultBytes <= 256 * 1024 ** 2, `the default (${defaultMaxBody}) must stay within the ceiling`);
+  // Bound to the exported ceiling rather than a literal, so lowering the ceiling
+  // below the default cannot pass unnoticed. The module already refuses to load in
+  // that state; this keeps the intent visible in the test too.
+  assert.ok(defaultBytes <= maxBodyCeilingBytes, `the default (${defaultMaxBody}) must stay within the ceiling`);
   const declared = renderGateway({ ...g, apps: [{ ...g.apps[0], maxBody: '256m' }] }).locations;
   assert.ok(declared.includes('client_max_body_size 256m;'));
   assert.ok(!declared.includes(`client_max_body_size ${defaultMaxBody};`));
