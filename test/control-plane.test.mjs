@@ -362,6 +362,33 @@ test('the shipped probe gives up on an application that trickles', async () => {
   }
 });
 
+test('the shipped probe gives up on a connection that never speaks', async () => {
+  // The other way to keep a socket busy without completing a response: send nothing
+  // at all. Nothing resets an idle timer here, so this one the idle timeout would
+  // have caught — it is covered because it is the shape a hung application actually
+  // takes, and because the two cases must not diverge.
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const started = Date.now();
+    const status = await Promise.race([
+      probeApplication(port, { timeoutMs: 300 }),
+      new Promise(resolve => setTimeout(() => resolve('never-settled'), 2_000)),
+    ]);
+    assert.equal(status, 'offline');
+    assert.ok(Date.now() - started < 1_200, 'a silent connection must not hold the probe open');
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('one unresponsive application cannot stretch the list past its budget', async () => {
   // This list is fetched by every sidebar refresh, so the wait is bounded for the
   // whole set rather than per application: with only a per-application budget, an
