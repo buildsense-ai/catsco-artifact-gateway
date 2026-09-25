@@ -56,7 +56,22 @@ const TRANSPORT_URL_PATTERN = /^wss:\/\/[a-zA-Z0-9.-]+(?::[0-9]+)?\/[a-zA-Z0-9/_
 //
 // A probe therefore never decides whether an application is *correct*, only
 // whether it is reachable — an application that answers 500 is reachable.
-const PROBE_TIMEOUT_MS = 1500;
+//
+// The timeout is set against what the deployment itself tolerates, not against
+// what feels fast. nginx allows an application 3s to accept the connection and
+// 65s to answer, so a healthy application may legitimately take seconds to
+// respond. Probing with a tighter budget than the one users are served under
+// would report a working application as offline — the opposite of the problem
+// this field exists to fix. It therefore matches the connect budget, and the
+// probe's own request is a plain GET that the deployment answers within it.
+const PROBE_TIMEOUT_MS = 3000;
+// The whole list shares one deadline, on top of the per-application timeout. With
+// a per-application budget alone, one unresponsive application per batch stretches
+// the request to a multiple of the timeout (ten such applications take two batches,
+// so six seconds), and this list is fetched by every sidebar refresh. Whatever the
+// deadline cuts off is reported as unknown rather than offline: the probe did not
+// answer, which is not the same as the application being down.
+const PROBE_BUDGET_MS = 4000;
 // One probe per application per window. The list is fetched by every sidebar
 // refresh and by the platform, so probing on every request would multiply a
 // cheap read into a fan-out of outbound connections.
@@ -98,7 +113,7 @@ function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
 // that was removed and published again gets a new forwarding port, and answering
 // its id from the old port's entry would report reachability for a socket nobody
 // checked.
-export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, probe = probeApplication } = {}) {
+export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, budgetMs = PROBE_BUDGET_MS, probe = probeApplication } = {}) {
   // 'id:port' -> { status, at }
   const entries = new Map();
   // 'id:port' -> promise, so concurrent callers wanting the same target share one
@@ -137,21 +152,25 @@ export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROB
   function probeTarget({ key, port }) {
     const running = inFlight.get(key);
     if (running) return running;
+    // A probe reports reachability and nothing else, so a probe that throws has
+    // established nothing and must not turn the list into a failure. The default
+    // probe already answers rather than throwing, but the seam is injectable, so
+    // the guarantee belongs here.
     const run = (async () => {
       await acquire();
       try {
         return await probe(port);
+      } catch {
+        return 'offline';
       } finally {
         release();
       }
     })();
     inFlight.set(key, run);
-    // The entry is written by the caller that started the probe, so a later
-    // caller inside the window reads the answer instead of probing again.
-    run.then(
-      status => entries.set(key, { status, at: Date.now() }),
-      () => entries.set(key, { status: 'offline', at: Date.now() }),
-    ).finally(() => inFlight.delete(key));
+    // The entry is written by whoever ran the probe, so a later caller inside the
+    // window reads the answer instead of probing again.
+    run.then(status => entries.set(key, { status, at: Date.now() }))
+      .finally(() => inFlight.delete(key));
     return run;
   }
 
@@ -163,9 +182,26 @@ export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROB
       if (entry && now - entry.at < cacheMs) statuses.set(target.id, entry.status);
       else missing.push(target);
     }
-    await Promise.all(missing.map(async target => {
-      statuses.set(target.id, await probeTarget(target));
+    if (!missing.length) return statuses;
+    // The budget is applied to the wait, not to the probe: a probe that is already
+    // running still records its answer for the next caller, but nobody waits past
+    // the deadline. Targets left unanswered are 'unknown' — the honest answer when
+    // nothing was established, and distinct from 'offline'.
+    //
+    // The probes write into a private map and the result is filled in once, after
+    // the race. Writing into the returned map from the background probes would let
+    // it keep changing after the caller already has it.
+    const answers = new Map();
+    const settled = Promise.all(missing.map(async target => {
+      answers.set(target.id, await probeTarget(target));
     }));
+    let timer = null;
+    const deadline = new Promise(resolve => { timer = setTimeout(resolve, budgetMs); });
+    await Promise.race([settled, deadline]);
+    clearTimeout(timer);
+    for (const target of missing) {
+      statuses.set(target.id, answers.has(target.id) ? answers.get(target.id) : 'unknown');
+    }
     return statuses;
   }
 

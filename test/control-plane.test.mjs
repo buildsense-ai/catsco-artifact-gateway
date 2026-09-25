@@ -261,6 +261,61 @@ test('the concurrency limit bounds probes across all callers at once', async () 
   assert.ok(peak <= 3, `at most 3 probes at once, saw ${peak}`);
 });
 
+test('a slow but healthy application is still reported online', async () => {
+  // The deployment lets an application take 3s to accept and 65s to answer, so a
+  // healthy application may legitimately take seconds. A probe with a tighter
+  // budget than the one users are served under would call it offline — reporting
+  // a working application as broken, which is the very confusion this field is
+  // meant to remove.
+  const probe = createStatusProbe({
+    cacheMs: 60_000,
+    probe: async () => { await new Promise(resolve => setTimeout(resolve, 2200)); return 'online'; },
+  });
+  const statuses = await probe.probeAll([{ id: 'slow', remotePort: 28191 }]);
+  assert.equal(statuses.get('slow'), 'online');
+});
+
+test('one unresponsive application cannot stretch the list past its budget', async () => {
+  // This list is fetched by every sidebar refresh, so the wait is bounded for the
+  // whole set rather than per application: with only a per-application budget, an
+  // application that accepts the connection and never answers costs a full timeout
+  // per batch, and the sidebar waits for all of them.
+  const probe = createStatusProbe({
+    budgetMs: 300,
+    concurrency: 2,
+    cacheMs: 60_000,
+    probe: async () => { await new Promise(resolve => setTimeout(resolve, 5_000)); return 'online'; },
+  });
+  const many = Array.from({ length: 8 }, (_, index) => ({ id: `s${index}`, remotePort: index + 1 }));
+  const started = Date.now();
+  const statuses = await probe.probeAll(many);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1_500, `the wait must be bounded by the budget, took ${elapsed}ms`);
+  // What the deadline cut off is 'unknown', not 'offline': nothing was established
+  // about those applications, and claiming they are down would be a guess.
+  for (const status of statuses.values()) assert.equal(status, 'unknown');
+  assert.equal(statuses.size, 8, 'every application must still get an answer');
+});
+
+test('a probe that outlives the budget still caches its answer', async () => {
+  // The deadline bounds the wait, not the probe: the connection that is already
+  // open finishes and records its result, so the next caller reads it instead of
+  // paying the timeout again.
+  let calls = 0;
+  const probe = createStatusProbe({
+    budgetMs: 50,
+    cacheMs: 60_000,
+    probe: async () => { calls += 1; await new Promise(resolve => setTimeout(resolve, 200)); return 'online'; },
+  });
+  const apps = [{ id: 'slow', remotePort: 28191 }];
+  const first = await probe.probeAll(apps);
+  assert.equal(first.get('slow'), 'unknown', 'the first caller does not wait past the budget');
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const second = await probe.probeAll(apps);
+  assert.equal(calls, 1, 'the finished probe must be reused, not run again');
+  assert.equal(second.get('slow'), 'online', 'the recorded answer is the real one');
+});
+
 test('the list reports a probe failure as offline rather than failing the request', async () => {
   await withServer(async ({ base }) => {
     const listed = await (await fetch(`${base}/api/apps`)).json();
@@ -269,6 +324,19 @@ test('the list reports a probe failure as offline rather than failing the reques
     assert.equal(listed.apps.length, CONFIG.apps.length);
     for (const app of listed.apps) assert.equal(app.status, 'offline');
   });
+});
+
+test('a probe that throws still leaves the list answering', async () => {
+  // Reachability is the only thing this field claims, so a probe that fails has
+  // established nothing and must not turn the sidebar's list into an error.
+  const throwing = createStatusProbe({ probe: async () => { throw new Error('probe exploded'); } });
+  await withServer(async ({ base }) => {
+    const response = await fetch(`${base}/api/apps`);
+    assert.equal(response.status, 200);
+    const listed = await response.json();
+    assert.equal(listed.apps.length, CONFIG.apps.length);
+    for (const app of listed.apps) assert.equal(app.status, 'offline');
+  }, { statusProbe: throwing });
 });
 
 test('list endpoint answers the sidebar and ignores unknown origins', async () => {
