@@ -84,25 +84,32 @@ const PROBE_CONCURRENCY = 8;
 // Only the response line matters, so the socket is destroyed as soon as headers
 // arrive. Draining the body instead would not be enough: `resume()` reads until
 // the response ends, and an application that streams — SSE, a progress feed, a
-// page that never finishes — keeps the connection open indefinitely, because
-// Node's `timeout` only fires while the socket is *idle* and a stream resets it.
-// Each probe would then leave a socket behind until the process runs out of file
-// descriptors, and every later probe would fail with EMFILE and report healthy
-// applications as offline.
+// page that never finishes — keeps the connection open indefinitely. Each probe
+// would then leave a socket behind until the process runs out of file descriptors,
+// and every later probe would fail with EMFILE and report healthy applications as
+// offline.
+//
+// The deadline is a wall clock, not `http.request`'s `timeout` option. That option
+// is an *idle* timer: any byte on the socket resets it, so an application that
+// trickles — a byte every few seconds, or a response line that never completes —
+// keeps a probe pending forever. A pending probe holds a slot in the concurrency
+// gate, and enough of them stop every other application from being probed at all.
 export function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return new Promise(resolve => {
     let settled = false;
+    let deadline = null;
     const finish = status => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       request.destroy();
       resolve(status);
     };
     const request = http.request(
-      { host: '127.0.0.1', port: remotePort, path: '/', method: 'GET', timeout: timeoutMs },
+      { host: '127.0.0.1', port: remotePort, path: '/', method: 'GET' },
       () => finish('online'),
     );
-    request.on('timeout', () => finish('offline'));
+    deadline = setTimeout(() => finish('offline'), timeoutMs);
     request.on('error', () => finish('offline'));
     request.end();
   });

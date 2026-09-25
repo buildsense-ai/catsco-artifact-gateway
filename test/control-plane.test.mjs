@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
@@ -322,6 +323,43 @@ test('the shipped probe reports an unreachable port as offline', async () => {
   const started = Date.now();
   assert.equal(await probeApplication(port), 'offline');
   assert.ok(Date.now() - started < 1000, 'a refused connection must not wait for the timeout');
+});
+
+test('the shipped probe gives up on an application that trickles', async () => {
+  // `http.request`'s `timeout` option is an *idle* timer: any byte resets it. An
+  // application that keeps a socket busy without ever completing its response line
+  // therefore never triggers it, and a probe that never settles holds a slot in the
+  // concurrency gate forever — enough of them stop every other application from
+  // being probed. The deadline has to be a wall clock.
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('HTTP/1.1 200 OK\r\nX-Filler: ');
+    const tick = setInterval(() => { if (!socket.destroyed) socket.write('x'); }, 20);
+    socket.on('close', () => clearInterval(tick));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const started = Date.now();
+    // Raced against an outer timer so a probe that never settles fails the test
+    // rather than hanging the run: a test that hangs is worse than one that fails,
+    // and this is exactly the regression being guarded against.
+    const status = await Promise.race([
+      probeApplication(port, { timeoutMs: 300 }),
+      new Promise(resolve => setTimeout(() => resolve('never-settled'), 2_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.equal(status, 'offline');
+    assert.ok(elapsed < 1_200, `the probe must give up on a wall clock, took ${elapsed}ms`);
+  } finally {
+    // Destroy the sockets directly: `closeAllConnections` belongs to http.Server,
+    // not net.Server, and `close` alone would wait forever on a probe that leaked.
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('one unresponsive application cannot stretch the list past its budget', async () => {
