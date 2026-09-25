@@ -80,19 +80,30 @@ const PROBE_CONCURRENCY = 8;
 
 // One application's reachability. Never rejects: an unreachable application is
 // an answer, not an error.
-function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+//
+// Only the response line matters, so the socket is destroyed as soon as headers
+// arrive. Draining the body instead would not be enough: `resume()` reads until
+// the response ends, and an application that streams — SSE, a progress feed, a
+// page that never finishes — keeps the connection open indefinitely, because
+// Node's `timeout` only fires while the socket is *idle* and a stream resets it.
+// Each probe would then leave a socket behind until the process runs out of file
+// descriptors, and every later probe would fail with EMFILE and report healthy
+// applications as offline.
+export function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   return new Promise(resolve => {
+    let settled = false;
+    const finish = status => {
+      if (settled) return;
+      settled = true;
+      request.destroy();
+      resolve(status);
+    };
     const request = http.request(
       { host: '127.0.0.1', port: remotePort, path: '/', method: 'GET', timeout: timeoutMs },
-      response => {
-        // The body is irrelevant and may be large: drain and discard it rather
-        // than letting the socket hold the gateway open.
-        response.resume();
-        resolve('online');
-      },
+      () => finish('online'),
     );
-    request.on('timeout', () => { request.destroy(); resolve('offline'); });
-    request.on('error', () => resolve('offline'));
+    request.on('timeout', () => finish('offline'));
+    request.on('error', () => finish('offline'));
     request.end();
   });
 }

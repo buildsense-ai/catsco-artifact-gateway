@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, createStatusProbe, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createControlPlane, createStatusProbe, probeApplication, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -261,18 +261,67 @@ test('the concurrency limit bounds probes across all callers at once', async () 
   assert.ok(peak <= 3, `at most 3 probes at once, saw ${peak}`);
 });
 
-test('a slow but healthy application is still reported online', async () => {
-  // The deployment lets an application take 3s to accept and 65s to answer, so a
-  // healthy application may legitimately take seconds. A probe with a tighter
-  // budget than the one users are served under would call it offline — reporting
-  // a working application as broken, which is the very confusion this field is
-  // meant to remove.
-  const probe = createStatusProbe({
-    cacheMs: 60_000,
-    probe: async () => { await new Promise(resolve => setTimeout(resolve, 2200)); return 'online'; },
+test('the shipped probe reports a slow but healthy application as online', async () => {
+  // This exercises `probeApplication` itself, with its own defaults, rather than an
+  // injected stand-in: the timeout is the thing under test, so replacing the probe
+  // would test nothing about it. The deployment lets an application take 3s to
+  // accept and 65s to answer, so a healthy application may legitimately take
+  // seconds — reporting it offline would be the very confusion this field removes.
+  // The delay sits between the old 1.5s budget and the shipped 3s one, so the test
+  // distinguishes them: a shorter timeout reports this application offline.
+  const server = http.createServer((request, response) => {
+    setTimeout(() => { response.writeHead(200); response.end('slow but fine'); }, 2000);
   });
-  const statuses = await probe.probeAll([{ id: 'slow', remotePort: 28191 }]);
-  assert.equal(statuses.get('slow'), 'online');
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    assert.equal(await probeApplication(port), 'online');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('the shipped probe closes the socket instead of streaming a body forever', async () => {
+  // Only the response line is needed, so the probe must not wait for a body that
+  // never ends. An application that streams — SSE, a progress feed — resets Node's
+  // *idle* timeout on every chunk, so draining the body would hold the connection
+  // open until the process runs out of file descriptors. Every probe after that
+  // fails with EMFILE and healthy applications get reported as offline.
+  let open = 0;
+  const server = http.createServer((request, response) => {
+    open += 1;
+    request.on('close', () => { open -= 1; });
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const tick = setInterval(() => response.write(': ping\n\n'), 20);
+    request.on('close', () => clearInterval(tick));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    for (let round = 0; round < 5; round += 1) {
+      assert.equal(await probeApplication(port), 'online');
+    }
+    // Give the close events a moment to land before judging how many are still open.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.ok(open <= 1, `the probe must not leave streaming sockets behind, ${open} still open`);
+  } finally {
+    // A leaked socket would keep `close` waiting forever, and a test that hangs is
+    // worse than one that fails: tear the connections down rather than awaiting them.
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('the shipped probe reports an unreachable port as offline', async () => {
+  // A port nothing listens on: the answer must be offline, and it must come back
+  // without waiting out the full timeout.
+  const server = http.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  const started = Date.now();
+  assert.equal(await probeApplication(port), 'offline');
+  assert.ok(Date.now() - started < 1000, 'a refused connection must not wait for the timeout');
 });
 
 test('one unresponsive application cannot stretch the list past its budget', async () => {
