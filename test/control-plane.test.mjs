@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createControlPlane, createStatusProbe, probeApplication, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -32,7 +33,7 @@ async function withServer(fn, options = {}) {
   // tests hand over a helper object that also carries `file` (the gateway config
   // they assert on), and a spread would make the viewer store write its state
   // into that very file.
-  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl } = options;
+  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
   const store = new ViewerStore({ file: tmpState() });
   const server = createControlPlane({
     config: config || CONFIG,
@@ -52,6 +53,11 @@ async function withServer(fn, options = {}) {
     // Default to a fetcher that refuses, so no test can silently reach the real
     // platform; the platform tests inject a loopback one.
     fetchImpl: fetchImpl || (() => { throw new Error('unexpected platform call'); }),
+    // Same rule for reachability: the configured test ports are not listening, so
+    // a real probe would make every list assertion depend on the machine it runs
+    // on. The default reports "nothing is listening", and the probe tests inject
+    // their own.
+    statusProbe: statusProbe || { probeAll: async apps => new Map(apps.map(app => [app.id, 'offline'])) },
     logger: { error() {} },
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -112,11 +118,339 @@ test('state survives a restart and the pseudonym secret is not rotated', () => {
 });
 
 test('public list exposes only id, title, url, status and time', () => {
+  // Without probes the list still answers, and says so honestly: 'unknown'
+  // rather than a claim that every application is reachable.
   const apps = buildAppList(CONFIG, { updatedAt: '2026-09-17T00:00:00.000Z' });
   assert.deepEqual(apps, [
-    { id: 'demo', title: '演示应用', url: 'https://artifact.example.cc/demo/', status: 'ready', updated_at: '2026-09-17T00:00:00.000Z' },
-    { id: 'other', title: 'other', url: 'https://artifact.example.cc/other/', status: 'ready', updated_at: '2026-09-17T00:00:00.000Z' },
+    { id: 'demo', title: '演示应用', url: 'https://artifact.example.cc/demo/', status: 'unknown', updated_at: '2026-09-17T00:00:00.000Z' },
+    { id: 'other', title: 'other', url: 'https://artifact.example.cc/other/', status: 'unknown', updated_at: '2026-09-17T00:00:00.000Z' },
   ]);
+  // A probe result is reported per application, and an application the probe did
+  // not cover stays 'unknown' instead of inheriting a neighbour's answer.
+  const probed = buildAppList(CONFIG, { statuses: new Map([['demo', 'online']]) });
+  assert.equal(probed[0].status, 'online');
+  assert.equal(probed[1].status, 'unknown');
+});
+
+// The list used to answer a constant 'ready', so a stopped application and a
+// healthy one looked the same. These two checks separate the cases the sidebar
+// could not previously tell apart, using the tunnel's own forwarding socket.
+test('a listening application is reported online even when it answers an error', async () => {
+  // 401 is the ordinary answer of an application that wants a login: it proves
+  // the local end is up, which is all the probe claims to know.
+  const app = http.createServer((req, res) => { res.writeHead(401); res.end('no'); });
+  await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
+  try {
+    const probe = createStatusProbe();
+    const statuses = await probe.probeAll([{ id: 'demo', remotePort: app.address().port }]);
+    assert.equal(statuses.get('demo'), 'online');
+  } finally { await new Promise(resolve => app.close(resolve)); }
+});
+
+test('a port with nothing behind it is reported offline', async () => {
+  // Bind and release, so the port is free and therefore refuses connections —
+  // the shape of a tunnel that is up while its application is not, and of a
+  // connector that never came back after a reboot.
+  const app = http.createServer();
+  await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
+  const port = app.address().port;
+  await new Promise(resolve => app.close(resolve));
+
+  const probe = createStatusProbe();
+  const statuses = await probe.probeAll([{ id: 'demo', remotePort: port }]);
+  assert.equal(statuses.get('demo'), 'offline');
+});
+
+test('the probe caches per target, so the caller cannot drive how much is probed', async () => {
+  let calls = 0;
+  const probe = createStatusProbe({ probe: async () => { calls += 1; return 'online'; }, cacheMs: 60_000 });
+  const apps = [{ id: 'demo', remotePort: 28191 }, { id: 'other', remotePort: 28192 }];
+  const first = await probe.probeAll(apps);
+  assert.equal(calls, 2);
+  const second = await probe.probeAll(apps);
+  assert.equal(calls, 2, 'a second call inside the window must not probe again');
+  assert.equal(second.get('demo'), 'online');
+  assert.deepEqual([...first.keys()].sort(), ['demo', 'other']);
+
+  // The cache is keyed by target, so an application that was removed and
+  // re-registered is probed again: its new forwarding socket has never been
+  // checked, and reporting the old port's answer would describe a socket nobody
+  // looked at.
+  await probe.probeAll([{ id: 'demo', remotePort: 28999 }, { id: 'other', remotePort: 28192 }]);
+  assert.equal(calls, 3, 'a changed port must be probed again, and only that target');
+
+  // A set that only differs by order is the same set of targets.
+  const current = [{ id: 'demo', remotePort: 28999 }, { id: 'other', remotePort: 28192 }];
+  await probe.probeAll([...current].reverse());
+  assert.equal(calls, 3, 'a reordered set is the same set');
+});
+
+test('alternating between two application sets does not multiply probing', async () => {
+  // `?agent=` is a public query parameter, so the caller decides which set is
+  // asked for. A cache keyed by the requested set would miss on every alternation
+  // and re-probe both sets in full, request after request — an unauthenticated
+  // caller driving outbound connections to every application of every bot it can
+  // name. Per-target caching makes the amount probed independent of who asks.
+  let calls = 0;
+  const probe = createStatusProbe({ probe: async () => { calls += 1; return 'online'; }, cacheMs: 60_000 });
+  const first = [{ id: 'a1', remotePort: 1 }, { id: 'a2', remotePort: 2 }, { id: 'a3', remotePort: 3 }];
+  const second = [{ id: 'b1', remotePort: 4 }, { id: 'b2', remotePort: 5 }];
+  for (let round = 0; round < 5; round += 1) {
+    await probe.probeAll(first);
+    await probe.probeAll(second);
+  }
+  assert.equal(calls, 5, 'ten alternating requests must cost one probe per target, not one per request');
+});
+
+test('adding one application probes only that application', async () => {
+  // The sidebar and the platform both poll this list; a registration must not
+  // turn into a full round over every application of that account.
+  let calls = 0;
+  const probe = createStatusProbe({ probe: async () => { calls += 1; return 'online'; }, cacheMs: 60_000 });
+  const base = [{ id: 'a1', remotePort: 1 }, { id: 'a2', remotePort: 2 }];
+  await probe.probeAll(base);
+  assert.equal(calls, 2);
+  await probe.probeAll([...base, { id: 'a3', remotePort: 3 }]);
+  assert.equal(calls, 3, 'only the new application needs a probe');
+});
+
+test('concurrent callers with different sets never share an answer', async () => {
+  const probe = createStatusProbe({
+    probe: async port => { await new Promise(resolve => setTimeout(resolve, 25)); return port === 28191 ? 'online' : 'offline'; },
+    cacheMs: 60_000,
+  });
+  const [left, right] = await Promise.all([
+    probe.probeAll([{ id: 'left', remotePort: 28191 }]),
+    probe.probeAll([{ id: 'right', remotePort: 28192 }]),
+  ]);
+  assert.equal(left.get('left'), 'online');
+  assert.equal(right.get('right'), 'offline');
+  assert.deepEqual([...left.keys()], ['left'], 'a caller must not receive another set\'s applications');
+  assert.deepEqual([...right.keys()], ['right']);
+});
+
+test('concurrent callers wanting the same target share one probe', async () => {
+  let calls = 0;
+  const probe = createStatusProbe({
+    probe: async () => { calls += 1; await new Promise(resolve => setTimeout(resolve, 20)); return 'online'; },
+    cacheMs: 60_000,
+  });
+  const apps = [{ id: 'demo', remotePort: 28191 }];
+  await Promise.all([probe.probeAll(apps), probe.probeAll(apps), probe.probeAll(apps)]);
+  assert.equal(calls, 1, 'the same target must cost one probe, not one per caller');
+});
+
+test('the concurrency limit bounds probes across all callers at once', async () => {
+  // The gate is per probe, not per request: a per-request limit would multiply by
+  // the number of concurrent requests, which is exactly what an unauthenticated
+  // caller can raise.
+  let active = 0;
+  let peak = 0;
+  const probe = createStatusProbe({
+    concurrency: 3,
+    cacheMs: 60_000,
+    probe: async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 15));
+      active -= 1;
+      return 'online';
+    },
+  });
+  const many = Array.from({ length: 20 }, (_, index) => ({ id: `s${index}`, remotePort: index + 1 }));
+  await Promise.all([probe.probeAll(many), probe.probeAll(many), probe.probeAll(many)]);
+  assert.ok(peak <= 3, `at most 3 probes at once, saw ${peak}`);
+});
+
+test('the shipped probe reports a slow but healthy application as online', async () => {
+  // This exercises `probeApplication` itself, with its own defaults, rather than an
+  // injected stand-in: the timeout is the thing under test, so replacing the probe
+  // would test nothing about it. The deployment lets an application take 3s to
+  // accept and 65s to answer, so a healthy application may legitimately take
+  // seconds — reporting it offline would be the very confusion this field removes.
+  // The delay sits between the old 1.5s budget and the shipped 3s one, so the test
+  // distinguishes them: a shorter timeout reports this application offline.
+  const server = http.createServer((request, response) => {
+    setTimeout(() => { response.writeHead(200); response.end('slow but fine'); }, 2000);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    assert.equal(await probeApplication(port), 'online');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('the shipped probe closes the socket instead of streaming a body forever', async () => {
+  // Only the response line is needed, so the probe must not wait for a body that
+  // never ends. An application that streams — SSE, a progress feed — resets Node's
+  // *idle* timeout on every chunk, so draining the body would hold the connection
+  // open until the process runs out of file descriptors. Every probe after that
+  // fails with EMFILE and healthy applications get reported as offline.
+  let open = 0;
+  const server = http.createServer((request, response) => {
+    open += 1;
+    request.on('close', () => { open -= 1; });
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const tick = setInterval(() => response.write(': ping\n\n'), 20);
+    request.on('close', () => clearInterval(tick));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    for (let round = 0; round < 5; round += 1) {
+      assert.equal(await probeApplication(port), 'online');
+    }
+    // Give the close events a moment to land before judging how many are still open.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.ok(open <= 1, `the probe must not leave streaming sockets behind, ${open} still open`);
+  } finally {
+    // A leaked socket would keep `close` waiting forever, and a test that hangs is
+    // worse than one that fails: tear the connections down rather than awaiting them.
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('the shipped probe reports an unreachable port as offline', async () => {
+  // A port nothing listens on: the answer must be offline, and it must come back
+  // without waiting out the full timeout.
+  const server = http.createServer();
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  await new Promise(resolve => server.close(resolve));
+  const started = Date.now();
+  assert.equal(await probeApplication(port), 'offline');
+  assert.ok(Date.now() - started < 1000, 'a refused connection must not wait for the timeout');
+});
+
+test('the shipped probe gives up on an application that trickles', async () => {
+  // `http.request`'s `timeout` option is an *idle* timer: any byte resets it. An
+  // application that keeps a socket busy without ever completing its response line
+  // therefore never triggers it, and a probe that never settles holds a slot in the
+  // concurrency gate forever — enough of them stop every other application from
+  // being probed. The deadline has to be a wall clock.
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    socket.write('HTTP/1.1 200 OK\r\nX-Filler: ');
+    const tick = setInterval(() => { if (!socket.destroyed) socket.write('x'); }, 20);
+    socket.on('close', () => clearInterval(tick));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const started = Date.now();
+    // Raced against an outer timer so a probe that never settles fails the test
+    // rather than hanging the run: a test that hangs is worse than one that fails,
+    // and this is exactly the regression being guarded against.
+    const status = await Promise.race([
+      probeApplication(port, { timeoutMs: 300 }),
+      new Promise(resolve => setTimeout(() => resolve('never-settled'), 2_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.equal(status, 'offline');
+    assert.ok(elapsed < 1_200, `the probe must give up on a wall clock, took ${elapsed}ms`);
+  } finally {
+    // Destroy the sockets directly: `closeAllConnections` belongs to http.Server,
+    // not net.Server, and `close` alone would wait forever on a probe that leaked.
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('the shipped probe gives up on a connection that never speaks', async () => {
+  // The other way to keep a socket busy without completing a response: send nothing
+  // at all. Nothing resets an idle timer here, so this one the idle timeout would
+  // have caught — it is covered because it is the shape a hung application actually
+  // takes, and because the two cases must not diverge.
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  try {
+    const started = Date.now();
+    const status = await Promise.race([
+      probeApplication(port, { timeoutMs: 300 }),
+      new Promise(resolve => setTimeout(() => resolve('never-settled'), 2_000)),
+    ]);
+    assert.equal(status, 'offline');
+    assert.ok(Date.now() - started < 1_200, 'a silent connection must not hold the probe open');
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('one unresponsive application cannot stretch the list past its budget', async () => {
+  // This list is fetched by every sidebar refresh, so the wait is bounded for the
+  // whole set rather than per application: with only a per-application budget, an
+  // application that accepts the connection and never answers costs a full timeout
+  // per batch, and the sidebar waits for all of them.
+  const probe = createStatusProbe({
+    budgetMs: 300,
+    concurrency: 2,
+    cacheMs: 60_000,
+    probe: async () => { await new Promise(resolve => setTimeout(resolve, 5_000)); return 'online'; },
+  });
+  const many = Array.from({ length: 8 }, (_, index) => ({ id: `s${index}`, remotePort: index + 1 }));
+  const started = Date.now();
+  const statuses = await probe.probeAll(many);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1_500, `the wait must be bounded by the budget, took ${elapsed}ms`);
+  // What the deadline cut off is 'unknown', not 'offline': nothing was established
+  // about those applications, and claiming they are down would be a guess.
+  for (const status of statuses.values()) assert.equal(status, 'unknown');
+  assert.equal(statuses.size, 8, 'every application must still get an answer');
+});
+
+test('a probe that outlives the budget still caches its answer', async () => {
+  // The deadline bounds the wait, not the probe: the connection that is already
+  // open finishes and records its result, so the next caller reads it instead of
+  // paying the timeout again.
+  let calls = 0;
+  const probe = createStatusProbe({
+    budgetMs: 50,
+    cacheMs: 60_000,
+    probe: async () => { calls += 1; await new Promise(resolve => setTimeout(resolve, 200)); return 'online'; },
+  });
+  const apps = [{ id: 'slow', remotePort: 28191 }];
+  const first = await probe.probeAll(apps);
+  assert.equal(first.get('slow'), 'unknown', 'the first caller does not wait past the budget');
+  await new Promise(resolve => setTimeout(resolve, 300));
+  const second = await probe.probeAll(apps);
+  assert.equal(calls, 1, 'the finished probe must be reused, not run again');
+  assert.equal(second.get('slow'), 'online', 'the recorded answer is the real one');
+});
+
+test('the list reports a probe failure as offline rather than failing the request', async () => {
+  await withServer(async ({ base }) => {
+    const listed = await (await fetch(`${base}/api/apps`)).json();
+    // The injected default probe reports offline; the important part is that the
+    // request answered 200 with a status per application instead of erroring.
+    assert.equal(listed.apps.length, CONFIG.apps.length);
+    for (const app of listed.apps) assert.equal(app.status, 'offline');
+  });
+});
+
+test('a probe that throws still leaves the list answering', async () => {
+  // Reachability is the only thing this field claims, so a probe that fails has
+  // established nothing and must not turn the sidebar's list into an error.
+  const throwing = createStatusProbe({ probe: async () => { throw new Error('probe exploded'); } });
+  await withServer(async ({ base }) => {
+    const response = await fetch(`${base}/api/apps`);
+    assert.equal(response.status, 200);
+    const listed = await response.json();
+    assert.equal(listed.apps.length, CONFIG.apps.length);
+    for (const app of listed.apps) assert.equal(app.status, 'offline');
+  }, { statusProbe: throwing });
 });
 
 test('list endpoint answers the sidebar and ignores unknown origins', async () => {

@@ -42,6 +42,190 @@ const WSS_PORT = 22444;
 // direction is the gateway publishing an endpoint to bots, not accepting one.
 const TRANSPORT_URL_PATTERN = /^wss:\/\/[a-zA-Z0-9.-]+(?::[0-9]+)?\/[a-zA-Z0-9/_-]+$/;
 
+// How the sidebar learns whether an application can actually be opened.
+//
+// The list used to answer a constant 'ready', which made every failure look the
+// same: a stopped application, a connector that never came back after a reboot,
+// and a healthy application were indistinguishable from the list. The two checks
+// below separate the three cases with no protocol change and nothing asked of the
+// connector, because the tunnel's forwarding socket is the whole story:
+//
+//   not listening        the tunnel is down (connector stopped, or never connected)
+//   listening, no answer the tunnel is up but nothing serves the local port
+//   listening, answered  both ends are up (any HTTP status counts, including 401)
+//
+// A probe therefore never decides whether an application is *correct*, only
+// whether it is reachable — an application that answers 500 is reachable.
+//
+// The timeout is set against what the deployment itself tolerates, not against
+// what feels fast. nginx allows an application 3s to accept the connection and
+// 65s to answer, so a healthy application may legitimately take seconds to
+// respond. Probing with a tighter budget than the one users are served under
+// would report a working application as offline — the opposite of the problem
+// this field exists to fix. It therefore matches the connect budget, and the
+// probe's own request is a plain GET that the deployment answers within it.
+const PROBE_TIMEOUT_MS = 3000;
+// The whole list shares one deadline, on top of the per-application timeout. With
+// a per-application budget alone, one unresponsive application per batch stretches
+// the request to a multiple of the timeout (ten such applications take two batches,
+// so six seconds), and this list is fetched by every sidebar refresh. Whatever the
+// deadline cuts off is reported as unknown rather than offline: the probe did not
+// answer, which is not the same as the application being down.
+const PROBE_BUDGET_MS = 4000;
+// One probe per application per window. The list is fetched by every sidebar
+// refresh and by the platform, so probing on every request would multiply a
+// cheap read into a fan-out of outbound connections.
+const PROBE_CACHE_MS = 10_000;
+const PROBE_CONCURRENCY = 8;
+
+// One application's reachability. Never rejects: an unreachable application is
+// an answer, not an error.
+//
+// Only the response line matters, so the socket is destroyed as soon as headers
+// arrive. Draining the body instead would not be enough: `resume()` reads until
+// the response ends, and an application that streams — SSE, a progress feed, a
+// page that never finishes — keeps the connection open indefinitely. Each probe
+// would then leave a socket behind until the process runs out of file descriptors,
+// and every later probe would fail with EMFILE and report healthy applications as
+// offline.
+//
+// The deadline is a wall clock, not `http.request`'s `timeout` option. That option
+// is an *idle* timer: any byte on the socket resets it, so an application that
+// trickles — a byte every few seconds, or a response line that never completes —
+// keeps a probe pending forever. A pending probe holds a slot in the concurrency
+// gate, and enough of them stop every other application from being probed at all.
+export function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  return new Promise(resolve => {
+    let settled = false;
+    let deadline = null;
+    const finish = status => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      request.destroy();
+      resolve(status);
+    };
+    const request = http.request(
+      { host: '127.0.0.1', port: remotePort, path: '/', method: 'GET' },
+      () => finish('online'),
+    );
+    deadline = setTimeout(() => finish('offline'), timeoutMs);
+    request.on('error', () => finish('offline'));
+    request.end();
+  });
+}
+
+// Probes the requested applications and answers a map of id -> status.
+//
+// The cache is keyed per *target* — an application id paired with the port that
+// is probed for it — not per request and not per set of applications. Keying by
+// the caller's set would let the caller drive the probing: `?agent=` decides the
+// set, it is a public query parameter, and alternating two agent ids would miss
+// the cache every time and re-probe both sets in full, request after request.
+// Per-target entries make the guarantee independent of who asks and of how they
+// order or group their applications: a target is probed at most once per window
+// no matter how many callers want it, and adding or removing one application
+// costs one probe rather than a full round.
+//
+// The key carries the port because the port is what is probed. An application
+// that was removed and published again gets a new forwarding port, and answering
+// its id from the old port's entry would report reachability for a socket nobody
+// checked.
+export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, budgetMs = PROBE_BUDGET_MS, probe = probeApplication } = {}) {
+  // 'id:port' -> { status, at }
+  const entries = new Map();
+  // 'id:port' -> promise, so concurrent callers wanting the same target share one
+  // probe instead of racing to open two connections to the same port.
+  const inFlight = new Map();
+  // A single gate for the whole probe, not one per request: the point is to bound
+  // outbound connections from this process, and per-request limits multiply by the
+  // number of concurrent requests.
+  let active = 0;
+  const waiting = [];
+
+  function acquire() {
+    if (active < concurrency) { active += 1; return Promise.resolve(); }
+    return new Promise(resolve => waiting.push(resolve));
+  }
+
+  function release() {
+    active -= 1;
+    const next = waiting.shift();
+    if (next) { active += 1; next(); }
+  }
+
+  function targetsOf(apps) {
+    const seen = new Set();
+    const targets = [];
+    for (const app of apps) {
+      if (!Number.isInteger(app?.remotePort) || typeof app?.id !== 'string') continue;
+      const key = `${app.id}:${app.remotePort}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ id: app.id, key, port: app.remotePort });
+    }
+    return targets;
+  }
+
+  function probeTarget({ key, port }) {
+    const running = inFlight.get(key);
+    if (running) return running;
+    // A probe reports reachability and nothing else, so a probe that throws has
+    // established nothing and must not turn the list into a failure. The default
+    // probe already answers rather than throwing, but the seam is injectable, so
+    // the guarantee belongs here.
+    const run = (async () => {
+      await acquire();
+      try {
+        return await probe(port);
+      } catch {
+        return 'offline';
+      } finally {
+        release();
+      }
+    })();
+    inFlight.set(key, run);
+    // The entry is written by whoever ran the probe, so a later caller inside the
+    // window reads the answer instead of probing again.
+    run.then(status => entries.set(key, { status, at: Date.now() }))
+      .finally(() => inFlight.delete(key));
+    return run;
+  }
+
+  async function probeAll(apps, now = Date.now()) {
+    const statuses = new Map();
+    const missing = [];
+    for (const target of targetsOf(apps)) {
+      const entry = entries.get(target.key);
+      if (entry && now - entry.at < cacheMs) statuses.set(target.id, entry.status);
+      else missing.push(target);
+    }
+    if (!missing.length) return statuses;
+    // The budget is applied to the wait, not to the probe: a probe that is already
+    // running still records its answer for the next caller, but nobody waits past
+    // the deadline. Targets left unanswered are 'unknown' — the honest answer when
+    // nothing was established, and distinct from 'offline'.
+    //
+    // The probes write into a private map and the result is filled in once, after
+    // the race. Writing into the returned map from the background probes would let
+    // it keep changing after the caller already has it.
+    const answers = new Map();
+    const settled = Promise.all(missing.map(async target => {
+      answers.set(target.id, await probeTarget(target));
+    }));
+    let timer = null;
+    const deadline = new Promise(resolve => { timer = setTimeout(resolve, budgetMs); });
+    await Promise.race([settled, deadline]);
+    clearTimeout(timer);
+    for (const target of missing) {
+      statuses.set(target.id, answers.has(target.id) ? answers.get(target.id) : 'unknown');
+    }
+    return statuses;
+  }
+
+  return { probeAll };
+}
+
 function json(res, status, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
@@ -259,7 +443,7 @@ a.primary{background:#1f6feb;color:#fff}a.secondary{border:1px solid #2a2f3a;col
 // returned to a bot-scoped caller: it belongs to no bot, so it appears in no
 // bot's sidebar. Only an unscoped caller (an operator or a future fleet view)
 // sees it.
-export function buildAppList(config, { updatedAt = null, agent = null } = {}) {
+export function buildAppList(config, { updatedAt = null, agent = null, statuses = null } = {}) {
   const host = config.publicHosts[0];
   return (config.apps || [])
     .filter(app => agent === null || String(app.agent) === agent)
@@ -267,7 +451,10 @@ export function buildAppList(config, { updatedAt = null, agent = null } = {}) {
       id: app.id,
       title: typeof app.title === 'string' && app.title.trim() ? app.title.trim() : app.id,
       url: `https://${host}/${app.id}/`,
-      status: 'ready',
+      // 'online' / 'offline' when a probe ran, and 'unknown' when the caller
+      // could not or did not probe. A list that cannot be probed still lists:
+      // saying nothing is better than claiming an application is reachable.
+      status: statuses?.get(app.id) ?? 'unknown',
       updated_at: updatedAt,
     }));
 }
@@ -326,6 +513,7 @@ export function createControlPlane({
   platformCookieName = PLATFORM_COOKIE_NAME,
   platformIdentityTimeoutMs = PLATFORM_TIMEOUT_MS,
   fetchImpl = globalThis.fetch,
+  statusProbe = createStatusProbe(),
 }) {
   if (!controlToken || controlToken.length < 32) throw new Error('Control token must be at least 32 characters');
   if (!store) throw new Error('Viewer store is required');
@@ -618,7 +806,17 @@ export function createControlPlane({
         if (req.method === 'OPTIONS') return json(res, 204, {}, corsHeaders(req));
         if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET' });
         const agent = agentRef(url.searchParams.get('agent'));
-        return json(res, 200, { apps: buildAppList(current.config, { updatedAt: current.updatedAt, agent }) }, corsHeaders(req));
+        // Probe before building, so the list reports reachability rather than a
+        // constant. A probe failure is never a list failure: an unreachable
+        // application is reported as offline and the request still answers 200.
+        const listed = (current.config.apps || []).filter(app => agent === null || String(app.agent) === agent);
+        let statuses = null;
+        try {
+          statuses = await statusProbe.probeAll(listed);
+        } catch (error) {
+          logger.error(JSON.stringify({ event: 'app_probe_failed', message: error?.message }));
+        }
+        return json(res, 200, { apps: buildAppList(current.config, { updatedAt: current.updatedAt, agent, statuses }) }, corsHeaders(req));
       }
 
       if (path === '/_gateway/health') {
