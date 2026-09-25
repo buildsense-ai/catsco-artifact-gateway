@@ -85,39 +85,57 @@ function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
 // Probes every application in one pass and answers a map of id -> status. The
 // cache is shared by all callers, so a burst of sidebar refreshes costs one round
 // of probes, and each application is probed at most once per window.
+//
+// Both the cache and the in-flight slot are keyed by the probed *targets* — the
+// id paired with its forwarding port — not by the id alone. An application that
+// was removed and re-registered gets a new port, and answering that id from the
+// old port's result would report reachability for a socket nobody checked. The
+// same key keeps two concurrent callers with different application sets from
+// sharing one round: without it the second caller would receive the first
+// caller's answer, including ids it never asked about.
 export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, probe = probeApplication } = {}) {
   let cached = new Map();
+  let cachedKey = null;
   let cachedAt = 0;
-  let inFlight = null;
+  let inFlight = new Map();
+
+  function targetsOf(apps) {
+    return apps
+      .filter(app => Number.isInteger(app?.remotePort))
+      .map(app => [app.id, app.remotePort])
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  }
+
+  function signatureOf(targets) {
+    return targets.map(([id, port]) => `${id}:${port}`).join('\n');
+  }
 
   async function probeAll(apps, now = Date.now()) {
-    const wanted = apps.map(app => [app.id, app.remotePort]).filter(([, port]) => Number.isInteger(port));
-    if (now - cachedAt < cacheMs) {
-      // A cached answer for an application that has since been removed or
-      // re-registered must not leak, and a new application must not be reported
-      // without a probe: fall through when the set of ids changed.
-      const sameSet = wanted.length === cached.size && wanted.every(([id]) => cached.has(id));
-      if (sameSet) return cached;
-    }
-    if (inFlight) return inFlight;
-    inFlight = (async () => {
+    const targets = targetsOf(apps);
+    const key = signatureOf(targets);
+    if (key === cachedKey && now - cachedAt < cacheMs) return cached;
+    const pending = inFlight.get(key);
+    if (pending) return pending;
+    const round = (async () => {
       const result = new Map();
       let cursor = 0;
-      const workers = Array.from({ length: Math.min(concurrency, wanted.length) }, async () => {
-        while (cursor < wanted.length) {
-          const [id, port] = wanted[cursor++];
+      const workers = Array.from({ length: Math.min(concurrency, targets.length) }, async () => {
+        while (cursor < targets.length) {
+          const [id, port] = targets[cursor++];
           result.set(id, await probe(port));
         }
       });
       await Promise.all(workers);
       cached = result;
+      cachedKey = key;
       cachedAt = Date.now();
       return result;
     })();
+    inFlight.set(key, round);
     try {
-      return await inFlight;
+      return await round;
     } finally {
-      inFlight = null;
+      inFlight.delete(key);
     }
   }
 

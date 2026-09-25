@@ -171,12 +171,49 @@ test('the probe caches, so a refresh burst costs one round of probes', async () 
   assert.equal(second.get('demo'), 'online');
   assert.deepEqual([...first.keys()].sort(), ['demo', 'other']);
 
-  // A changed set of applications must not reuse the cached answers: a new
-  // application has never been probed, and a removed one must not linger. The
-  // whole set is re-probed rather than patched, so no entry can outlive its
-  // application.
-  await probe.probeAll([...apps, { id: 'third', remotePort: 28193 }]);
-  assert.equal(calls, 5, 'a changed set must be probed again in full');
+  // The cache is keyed by id *and* port, so an application that was removed and
+  // re-registered is probed again: its new forwarding socket has never been
+  // checked, and reporting the old port's answer would describe a socket nobody
+  // looked at. The set of ids alone is unchanged here, which is exactly why the
+  // key cannot be the ids.
+  await probe.probeAll([{ id: 'demo', remotePort: 28999 }, { id: 'other', remotePort: 28192 }]);
+  assert.equal(calls, 4, 'a changed port must be probed again, not answered from the cache');
+
+  // A set that only differs by order is the same set: the sidebar and the
+  // platform may list the same applications in any order, and re-probing then
+  // would defeat the cache.
+  const current = [{ id: 'demo', remotePort: 28999 }, { id: 'other', remotePort: 28192 }];
+  await probe.probeAll([...current].reverse());
+  assert.equal(calls, 4, 'a reordered set is the same set');
+});
+
+test('concurrent callers with different sets never share an answer', async () => {
+  // The in-flight slot is keyed like the cache. A single shared slot would hand
+  // the second caller the first caller's result — including applications it
+  // never asked about, and omitting its own.
+  const probe = createStatusProbe({
+    probe: async port => { await new Promise(resolve => setTimeout(resolve, 25)); return port === 28191 ? 'online' : 'offline'; },
+    cacheMs: 60_000,
+  });
+  const [left, right] = await Promise.all([
+    probe.probeAll([{ id: 'left', remotePort: 28191 }]),
+    probe.probeAll([{ id: 'right', remotePort: 28192 }]),
+  ]);
+  assert.equal(left.get('left'), 'online');
+  assert.equal(right.get('right'), 'offline');
+  assert.deepEqual([...left.keys()], ['left'], 'a caller must not receive another set\'s applications');
+  assert.deepEqual([...right.keys()], ['right']);
+});
+
+test('callers asking for the same set at once share one round', async () => {
+  let calls = 0;
+  const probe = createStatusProbe({
+    probe: async () => { calls += 1; await new Promise(resolve => setTimeout(resolve, 20)); return 'online'; },
+    cacheMs: 60_000,
+  });
+  const apps = [{ id: 'demo', remotePort: 28191 }];
+  await Promise.all([probe.probeAll(apps), probe.probeAll(apps), probe.probeAll(apps)]);
+  assert.equal(calls, 1, 'the same set must cost one round, not one per caller');
 });
 
 test('the list reports a probe failure as offline rather than failing the request', async () => {
