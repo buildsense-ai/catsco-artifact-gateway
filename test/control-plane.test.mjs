@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createControlPlane, createStatusProbe, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
@@ -32,7 +32,7 @@ async function withServer(fn, options = {}) {
   // tests hand over a helper object that also carries `file` (the gateway config
   // they assert on), and a spread would make the viewer store write its state
   // into that very file.
-  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl } = options;
+  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
   const store = new ViewerStore({ file: tmpState() });
   const server = createControlPlane({
     config: config || CONFIG,
@@ -52,6 +52,11 @@ async function withServer(fn, options = {}) {
     // Default to a fetcher that refuses, so no test can silently reach the real
     // platform; the platform tests inject a loopback one.
     fetchImpl: fetchImpl || (() => { throw new Error('unexpected platform call'); }),
+    // Same rule for reachability: the configured test ports are not listening, so
+    // a real probe would make every list assertion depend on the machine it runs
+    // on. The default reports "nothing is listening", and the probe tests inject
+    // their own.
+    statusProbe: statusProbe || { probeAll: async apps => new Map(apps.map(app => [app.id, 'offline'])) },
     logger: { error() {} },
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -112,11 +117,76 @@ test('state survives a restart and the pseudonym secret is not rotated', () => {
 });
 
 test('public list exposes only id, title, url, status and time', () => {
+  // Without probes the list still answers, and says so honestly: 'unknown'
+  // rather than a claim that every application is reachable.
   const apps = buildAppList(CONFIG, { updatedAt: '2026-09-17T00:00:00.000Z' });
   assert.deepEqual(apps, [
-    { id: 'demo', title: '演示应用', url: 'https://artifact.example.cc/demo/', status: 'ready', updated_at: '2026-09-17T00:00:00.000Z' },
-    { id: 'other', title: 'other', url: 'https://artifact.example.cc/other/', status: 'ready', updated_at: '2026-09-17T00:00:00.000Z' },
+    { id: 'demo', title: '演示应用', url: 'https://artifact.example.cc/demo/', status: 'unknown', updated_at: '2026-09-17T00:00:00.000Z' },
+    { id: 'other', title: 'other', url: 'https://artifact.example.cc/other/', status: 'unknown', updated_at: '2026-09-17T00:00:00.000Z' },
   ]);
+  // A probe result is reported per application, and an application the probe did
+  // not cover stays 'unknown' instead of inheriting a neighbour's answer.
+  const probed = buildAppList(CONFIG, { statuses: new Map([['demo', 'online']]) });
+  assert.equal(probed[0].status, 'online');
+  assert.equal(probed[1].status, 'unknown');
+});
+
+// The list used to answer a constant 'ready', so a stopped application and a
+// healthy one looked the same. These two checks separate the cases the sidebar
+// could not previously tell apart, using the tunnel's own forwarding socket.
+test('a listening application is reported online even when it answers an error', async () => {
+  // 401 is the ordinary answer of an application that wants a login: it proves
+  // the local end is up, which is all the probe claims to know.
+  const app = http.createServer((req, res) => { res.writeHead(401); res.end('no'); });
+  await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
+  try {
+    const probe = createStatusProbe();
+    const statuses = await probe.probeAll([{ id: 'demo', remotePort: app.address().port }]);
+    assert.equal(statuses.get('demo'), 'online');
+  } finally { await new Promise(resolve => app.close(resolve)); }
+});
+
+test('a port with nothing behind it is reported offline', async () => {
+  // Bind and release, so the port is free and therefore refuses connections —
+  // the shape of a tunnel that is up while its application is not, and of a
+  // connector that never came back after a reboot.
+  const app = http.createServer();
+  await new Promise(resolve => app.listen(0, '127.0.0.1', resolve));
+  const port = app.address().port;
+  await new Promise(resolve => app.close(resolve));
+
+  const probe = createStatusProbe();
+  const statuses = await probe.probeAll([{ id: 'demo', remotePort: port }]);
+  assert.equal(statuses.get('demo'), 'offline');
+});
+
+test('the probe caches, so a refresh burst costs one round of probes', async () => {
+  let calls = 0;
+  const probe = createStatusProbe({ probe: async () => { calls += 1; return 'online'; }, cacheMs: 60_000 });
+  const apps = [{ id: 'demo', remotePort: 28191 }, { id: 'other', remotePort: 28192 }];
+  const first = await probe.probeAll(apps);
+  assert.equal(calls, 2);
+  const second = await probe.probeAll(apps);
+  assert.equal(calls, 2, 'a second call inside the window must not probe again');
+  assert.equal(second.get('demo'), 'online');
+  assert.deepEqual([...first.keys()].sort(), ['demo', 'other']);
+
+  // A changed set of applications must not reuse the cached answers: a new
+  // application has never been probed, and a removed one must not linger. The
+  // whole set is re-probed rather than patched, so no entry can outlive its
+  // application.
+  await probe.probeAll([...apps, { id: 'third', remotePort: 28193 }]);
+  assert.equal(calls, 5, 'a changed set must be probed again in full');
+});
+
+test('the list reports a probe failure as offline rather than failing the request', async () => {
+  await withServer(async ({ base }) => {
+    const listed = await (await fetch(`${base}/api/apps`)).json();
+    // The injected default probe reports offline; the important part is that the
+    // request answered 200 with a status per application instead of erroring.
+    assert.equal(listed.apps.length, CONFIG.apps.length);
+    for (const app of listed.apps) assert.equal(app.status, 'offline');
+  });
 });
 
 test('list endpoint answers the sidebar and ignores unknown origins', async () => {
