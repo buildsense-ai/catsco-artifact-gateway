@@ -82,61 +82,91 @@ function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
   });
 }
 
-// Probes every application in one pass and answers a map of id -> status. The
-// cache is shared by all callers, so a burst of sidebar refreshes costs one round
-// of probes, and each application is probed at most once per window.
+// Probes the requested applications and answers a map of id -> status.
 //
-// Both the cache and the in-flight slot are keyed by the probed *targets* — the
-// id paired with its forwarding port — not by the id alone. An application that
-// was removed and re-registered gets a new port, and answering that id from the
-// old port's result would report reachability for a socket nobody checked. The
-// same key keeps two concurrent callers with different application sets from
-// sharing one round: without it the second caller would receive the first
-// caller's answer, including ids it never asked about.
+// The cache is keyed per *target* — an application id paired with the port that
+// is probed for it — not per request and not per set of applications. Keying by
+// the caller's set would let the caller drive the probing: `?agent=` decides the
+// set, it is a public query parameter, and alternating two agent ids would miss
+// the cache every time and re-probe both sets in full, request after request.
+// Per-target entries make the guarantee independent of who asks and of how they
+// order or group their applications: a target is probed at most once per window
+// no matter how many callers want it, and adding or removing one application
+// costs one probe rather than a full round.
+//
+// The key carries the port because the port is what is probed. An application
+// that was removed and published again gets a new forwarding port, and answering
+// its id from the old port's entry would report reachability for a socket nobody
+// checked.
 export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, probe = probeApplication } = {}) {
-  let cached = new Map();
-  let cachedKey = null;
-  let cachedAt = 0;
-  let inFlight = new Map();
+  // 'id:port' -> { status, at }
+  const entries = new Map();
+  // 'id:port' -> promise, so concurrent callers wanting the same target share one
+  // probe instead of racing to open two connections to the same port.
+  const inFlight = new Map();
+  // A single gate for the whole probe, not one per request: the point is to bound
+  // outbound connections from this process, and per-request limits multiply by the
+  // number of concurrent requests.
+  let active = 0;
+  const waiting = [];
 
-  function targetsOf(apps) {
-    return apps
-      .filter(app => Number.isInteger(app?.remotePort))
-      .map(app => [app.id, app.remotePort])
-      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+  function acquire() {
+    if (active < concurrency) { active += 1; return Promise.resolve(); }
+    return new Promise(resolve => waiting.push(resolve));
   }
 
-  function signatureOf(targets) {
-    return targets.map(([id, port]) => `${id}:${port}`).join('\n');
+  function release() {
+    active -= 1;
+    const next = waiting.shift();
+    if (next) { active += 1; next(); }
+  }
+
+  function targetsOf(apps) {
+    const seen = new Set();
+    const targets = [];
+    for (const app of apps) {
+      if (!Number.isInteger(app?.remotePort) || typeof app?.id !== 'string') continue;
+      const key = `${app.id}:${app.remotePort}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ id: app.id, key, port: app.remotePort });
+    }
+    return targets;
+  }
+
+  function probeTarget({ key, port }) {
+    const running = inFlight.get(key);
+    if (running) return running;
+    const run = (async () => {
+      await acquire();
+      try {
+        return await probe(port);
+      } finally {
+        release();
+      }
+    })();
+    inFlight.set(key, run);
+    // The entry is written by the caller that started the probe, so a later
+    // caller inside the window reads the answer instead of probing again.
+    run.then(
+      status => entries.set(key, { status, at: Date.now() }),
+      () => entries.set(key, { status: 'offline', at: Date.now() }),
+    ).finally(() => inFlight.delete(key));
+    return run;
   }
 
   async function probeAll(apps, now = Date.now()) {
-    const targets = targetsOf(apps);
-    const key = signatureOf(targets);
-    if (key === cachedKey && now - cachedAt < cacheMs) return cached;
-    const pending = inFlight.get(key);
-    if (pending) return pending;
-    const round = (async () => {
-      const result = new Map();
-      let cursor = 0;
-      const workers = Array.from({ length: Math.min(concurrency, targets.length) }, async () => {
-        while (cursor < targets.length) {
-          const [id, port] = targets[cursor++];
-          result.set(id, await probe(port));
-        }
-      });
-      await Promise.all(workers);
-      cached = result;
-      cachedKey = key;
-      cachedAt = Date.now();
-      return result;
-    })();
-    inFlight.set(key, round);
-    try {
-      return await round;
-    } finally {
-      inFlight.delete(key);
+    const statuses = new Map();
+    const missing = [];
+    for (const target of targetsOf(apps)) {
+      const entry = entries.get(target.key);
+      if (entry && now - entry.at < cacheMs) statuses.set(target.id, entry.status);
+      else missing.push(target);
     }
+    await Promise.all(missing.map(async target => {
+      statuses.set(target.id, await probeTarget(target));
+    }));
+    return statuses;
   }
 
   return { probeAll };
