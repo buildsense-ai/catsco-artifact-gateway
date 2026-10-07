@@ -15,7 +15,11 @@ ProtectHome=true
 PrivateTmp=true
 MemoryMax=128M
 TasksMax=32
-LimitNOFILE=1024
+# Two descriptors per tunnel (the websocket plus the loopback sshd socket). The
+# default of 1024 caps the process near 500 tunnels, which is below where the
+# connection limit is meant to sit, so the allowance is raised to keep the socket
+# budget from becoming the limit that is hit first.
+LimitNOFILE=2048
 CPUQuota=25%
 
 [Install]

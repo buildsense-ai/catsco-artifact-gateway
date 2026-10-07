@@ -12,6 +12,26 @@
 
 P0 服务使用内存、CPU、任务数上限；OpenSSH 按密钥 permitlisten 限定端口；禁用 session channel（MaxSessions 0）、密码、root、local forwarding、Unix socket forwarding、agent forwarding、TTY。
 
+## 隧道并发上限
+
+WSS adapter 同时最多承载 `TUNNEL_MAX_CONNECTIONS` 条隧道，默认 **160**，超出的连接直接收到 `403`，已在跑的隧道不受影响。
+
+这个池是**全局共享的**，不是按 bot 或按应用分配：隧道 URL 不携带身份，adapter 能数的只有它持有的全部连接。所以上限要按「网关上所有应用的总数」来定，而不是某个账号的份额。
+
+定值依据是内存，不是 socket。每条隧道会拉起一对 sshd 进程，实测约 13 MB，所以 160 条约占 2 GB —— 在当前主机（7.5 GB）上是安全的；`/health` 会同时报出 `activeConnections` 与 `maxConnections`，接近上限时应当扩容而不是等用户报连不上。
+
+两条相关的调整：
+
+- **提高上限时要同时确认 `LimitNOFILE`。** 每条隧道占 2 个 fd，`ws-gateway.service` 已从 1024 提到 2048；socket 预算不该先于连接上限被撞到。
+- **`ws-gateway.service` 由 CI 之外的一次性安装负责**（`deploy-prod.yml` 只安装 `cag-apply.*` 与 `control-plane.service`）。改了这个 unit 之后，线上要重新安装才生效：
+
+  ```sh
+  install -m 644 deploy/ws-gateway.service /etc/systemd/system/
+  systemctl daemon-reload && systemctl restart catsco-artifact-gateway-wss-p0
+  ```
+
+  连接上限本身写在代码里（默认 160），所以源码更新即生效；只有 unit 里的资源限制需要这一步。
+
 ## 当前试验部署位置
 
 - CatsCompany：`catsco-artifact-gateway-p0.service`、`catsco-artifact-gateway-wss-p0.service`。
