@@ -97,6 +97,13 @@ jobs:
           ssh cag "sudo -n systemctl restart $WSS_UNIT"
           sleep 2
           ssh cag "sudo -n systemctl is-active $WSS_UNIT"
+          # `/_gateway/health` belongs to the control plane, so it cannot report
+          # anything about the adapter. Ask the adapter on its loopback port
+          # instead: the field only exists in the version that reads the limit at
+          # startup, which is what makes this a check that the restart took.
+          health=$(ssh cag "curl -fsS http://127.0.0.1:22444/health")
+          echo "wss health: $health"
+          echo "$health" | grep -q '"maxConnections"'
 
       - name: Verify
         run: |
@@ -104,10 +111,6 @@ jobs:
           health=$(curl -fsS https://artifact.catsco.cc/_gateway/health)
           echo "health: $health"
           echo "$health" | grep -q '"ok":true'
-          # The adapter must report the limit it actually runs with, so a restart
-          # that silently kept the old process is caught here rather than by a
-          # user whose application cannot connect.
-          echo "$health" | grep -q '"maxConnections"'
           # Registration is a platform-to-gateway call, so it must be reachable
           # from outside on both public domains, and refuse an anonymous caller.
           for host in artifact.catsco.cc artifact.catsco.cn; do
