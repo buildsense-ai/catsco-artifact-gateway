@@ -24,6 +24,11 @@ jobs:
     env:
       GATEWAY_ROOT: /opt/catsco-artifact-gateway
       UNIT: catsco-artifact-gateway-control-plane
+      WSS_UNIT: catsco-artifact-gateway-wss-p0
+      # The tunnel limit the adapter must report after a deploy. Kept here so the
+      # deploy fails loudly if the default reverts, instead of only checking that
+      # the field exists. Change this together with DEFAULT_TUNNEL_MAX_CONNECTIONS.
+      EXPECTED_TUNNEL_MAX: "160"
     steps:
       - uses: actions/checkout@v6
 
@@ -61,13 +66,17 @@ jobs:
 
       - name: Install or refresh the units
         # Everything here is idempotent: the root helper, the path unit that
-        # watches gateway.json, and the control-plane unit itself (which needs
-        # ReadWritePaths, or the registration API cannot write its own config).
+        # watches gateway.json, and the two long-running units. The control plane
+        # needs ReadWritePaths, or the registration API cannot write its own
+        # config. The WSS adapter is installed here too, or a change to its limit
+        # would be copied to the host and never take effect: it reads that file
+        # only at startup, and nothing else installs its unit.
         run: |
           ssh cag "set -e
             sudo -n chmod 755 $GATEWAY_ROOT/deploy/apply-config.sh
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/cag-apply.service $GATEWAY_ROOT/deploy/cag-apply.path /etc/systemd/system/
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/control-plane.service /etc/systemd/system/$UNIT.service
+            sudo -n install -m 644 $GATEWAY_ROOT/deploy/ws-gateway.service /etc/systemd/system/$WSS_UNIT.service
             sudo -n systemctl daemon-reload
             sudo -n systemctl enable --now cag-apply.path"
 
@@ -82,6 +91,24 @@ jobs:
           ssh cag "sudo -n systemctl restart $UNIT"
           sleep 2
           ssh cag "sudo -n systemctl is-active $UNIT"
+
+      - name: Restart the WSS adapter
+        # The adapter reads TUNNEL_MAX_CONNECTIONS once, at startup, so a copied
+        # source file is not a deployed change. Restarting drops the open tunnels;
+        # connectors treat that as a normal disconnect and reconnect within a few
+        # seconds.
+        run: |
+          set -e
+          ssh cag "sudo -n systemctl restart $WSS_UNIT"
+          sleep 2
+          ssh cag "sudo -n systemctl is-active $WSS_UNIT"
+          # `/_gateway/health` belongs to the control plane, so it cannot report
+          # anything about the adapter. Ask the adapter on its loopback port
+          # instead, and compare the value rather than only looking for the field:
+          # a deploy that left the limit at its old default would otherwise pass.
+          health=$(ssh cag "curl -fsS http://127.0.0.1:22444/health")
+          echo "wss health: $health"
+          echo "$health" | grep -q "\"maxConnections\":$EXPECTED_TUNNEL_MAX"
 
       - name: Verify
         run: |

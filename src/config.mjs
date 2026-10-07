@@ -34,12 +34,19 @@ export function appTitle(value) {
 // honoured rather than discovering it on the first upload that no longer fits.
 const bodySizeUnits = { '': 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
 
-export function bodySize(value, ceilingBytes) {
+// The one place a size string becomes bytes, so a caller that needs to compare
+// two sizes does not re-implement the unit table (and get an unknown unit wrong).
+export function bodySizeBytes(value, ceilingBytes) {
   const match = typeof value === 'string' ? /^([1-9][0-9]{0,9})([kKmMgG]?)$/.exec(value) : null;
   if (!match) throw new Error('Invalid maxBody');
   const unit = match[2].toLowerCase();
   const bytes = Number(match[1]) * bodySizeUnits[unit];
   if (!Number.isSafeInteger(bytes) || bytes > ceilingBytes) throw new Error('maxBody exceeds the gateway ceiling');
+  return bytes;
+}
+
+export function bodySize(value, ceilingBytes) {
+  bodySizeBytes(value, ceilingBytes);
   return value;
 }
 // Absolute https endpoint on a named host with a restricted path charset and no
@@ -58,6 +65,28 @@ export function httpsUrl(value, field = 'URL') {
 export function cookieName(value) {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_.-]{1,64}$/.test(value)) throw new Error('Invalid cookie name');
   return value;
+}
+// How many tunnels may be open at once. One pool is shared by every bot — this is
+// not a per-user quota — so the value has to hold every application on the gateway
+// rather than one account's share.
+//
+// The ceiling is about memory, not sockets: each tunnel spawns a pair of sshd
+// processes costing roughly 13 MB, so the limit is what stops a burst of
+// applications from exhausting the host. 160 leaves room for growth on the
+// current host (about 2 GB of a 4.4 GB budget) while staying far below the point
+// where the service's file descriptor allowance would matter.
+//
+// The upper bound is a sanity rail, not a capacity statement: a typo of 999999
+// would be accepted by a naive check and then take the host down on the first
+// busy minute.
+export const DEFAULT_TUNNEL_MAX_CONNECTIONS = 160;
+export function tunnelMaxConnections(value) {
+  if (value === undefined || value === null || value === '') return DEFAULT_TUNNEL_MAX_CONNECTIONS;
+  const limit = Number(value);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 4096) {
+    throw new Error('Expected TUNNEL_MAX_CONNECTIONS to be an integer between 1 and 4096');
+  }
+  return limit;
 }
 export function validateConnector(c) {
   name(c.appId); name(c.user);
