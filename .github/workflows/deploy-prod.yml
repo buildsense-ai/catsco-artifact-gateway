@@ -57,12 +57,13 @@ jobs:
             | ssh cag "sudo -n tar -xzf - -C $GATEWAY_ROOT && sudo -n chown -R root:root $GATEWAY_ROOT/src $GATEWAY_ROOT/scripts $GATEWAY_ROOT/deploy $GATEWAY_ROOT/docs $GATEWAY_ROOT/package.json $GATEWAY_ROOT/package-lock.json $GATEWAY_ROOT/README.md"
 
       - name: Ensure the runtime dependency is present
-        # The control plane is a plain node process; `ws` is its only dependency
-        # and it is already installed on the host. Failing loudly here is better
-        # than deploying a process that cannot load. The check needs sudo: the
-        # gateway tree is root-owned and node_modules is 0750, so the deploy user
-        # cannot see it without asking.
-        run: ssh cag "sudo -n test -d $GATEWAY_ROOT/node_modules/ws || { echo 'missing node_modules/ws — run npm ci in $GATEWAY_ROOT on the gateway host'; exit 1; }"
+        # The gateway is a plain node process; `ws` is its only dependency and it is
+        # already installed on the host. Failing loudly here is better than deploying
+        # a process that cannot load. Existence is not enough: the tree is root-owned
+        # and `node_modules` was once tightened to 0750, which leaves `ws` present but
+        # unreadable to `cag_ingress` — the unit then crash-loops and every tunnel
+        # goes down. Read it as the service user, which is what the unit will do.
+        run: ssh cag "sudo -n -u cag_ingress test -r $GATEWAY_ROOT/node_modules/ws/index.js || { echo 'node_modules/ws is not readable by the service user — run npm ci and fix permissions in $GATEWAY_ROOT on the gateway host'; exit 1; }"
 
       - name: Install or refresh the units
         # Everything here is idempotent: the root helper, the path unit that
@@ -99,6 +100,13 @@ jobs:
         # seconds.
         run: |
           set -e
+          # Prove the adapter would start before stopping the one that is running.
+          # Importing alone is not enough: it only shows the module tree resolves,
+          # and the values that decide whether startup succeeds are read later, in
+          # `createTunnelServer` — an out-of-range TUNNEL_MAX_CONNECTIONS throws
+          # there and nowhere else. Calling it also exercises that validation. It
+          # binds no port, so the running adapter is untouched.
+          ssh cag "sudo -n -u cag_ingress /usr/local/bin/node -e '(async () => { try { const m = await import(\"$GATEWAY_ROOT/src/ws-gateway.mjs\"); const { limit } = m.createTunnelServer({ maxConnections: process.env.TUNNEL_MAX_CONNECTIONS }); console.log(\"adapter would start with maxConnections=\" + limit); } catch (e) { console.error(e.message); process.exit(1); } })()'"
           ssh cag "sudo -n systemctl restart $WSS_UNIT"
           sleep 2
           ssh cag "sudo -n systemctl is-active $WSS_UNIT"
