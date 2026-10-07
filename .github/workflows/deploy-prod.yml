@@ -100,14 +100,13 @@ jobs:
         # seconds.
         run: |
           set -e
-          # Confirm the adapter can actually start before stopping the running one.
-          # `ws` is the only dependency and the gateway tree is root-owned, so a
-          # permission change under node_modules leaves the file present and the
-          # module unloadable — the service then crash-loops and every tunnel is
-          # down. Importing here proves readability without binding a port, and it
-          # runs before the restart, so a broken tree fails the deploy while the
-          # old process keeps serving.
-          ssh cag "sudo -n -u cag_ingress /usr/local/bin/node -e 'import(\"$GATEWAY_ROOT/src/ws-gateway.mjs\").then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1); })'"
+          # Prove the adapter would start before stopping the one that is running.
+          # Importing alone is not enough: it only shows the module tree resolves,
+          # and the values that decide whether startup succeeds are read later, in
+          # `createTunnelServer` — an out-of-range TUNNEL_MAX_CONNECTIONS throws
+          # there and nowhere else. Calling it also exercises that validation. It
+          # binds no port, so the running adapter is untouched.
+          ssh cag "sudo -n -u cag_ingress /usr/local/bin/node -e '(async () => { try { const m = await import(\"$GATEWAY_ROOT/src/ws-gateway.mjs\"); const { limit } = m.createTunnelServer({ maxConnections: process.env.TUNNEL_MAX_CONNECTIONS }); console.log(\"adapter would start with maxConnections=\" + limit); } catch (e) { console.error(e.message); process.exit(1); } })()'"
           ssh cag "sudo -n systemctl restart $WSS_UNIT"
           sleep 2
           ssh cag "sudo -n systemctl is-active $WSS_UNIT"

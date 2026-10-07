@@ -165,3 +165,47 @@ test('only the tunnel path is upgraded, and a browser origin is refused', async 
     assert.equal(withOrigin.status, 403);
   });
 });
+
+// The deploy gate calls createTunnelServer so that a bad limit fails the deploy
+// instead of the restart. That only works if the constructor is where the value is
+// validated, and if constructing does not itself open a listener.
+test('constructing a server validates the limit without binding a port', async () => {
+  assert.throws(() => createTunnelServer({ maxConnections: '0' }), /between 1 and 4096/);
+  assert.throws(() => createTunnelServer({ maxConnections: 'abc' }), /between 1 and 4096/);
+
+  const built = createTunnelServer({ maxConnections: undefined });
+  assert.equal(built.limit, DEFAULT_TUNNEL_MAX_CONNECTIONS);
+  assert.equal(built.server.listening, false, 'constructing must not listen');
+  built.wss.close();
+  built.server.close();
+});
+
+// The deploy gate imports this module as the service user to prove the tree is
+// loadable before it restarts the adapter. That probe is only safe while importing
+// has no side effect: if the entry guard ever becomes true under `node -e`, the
+// probe would try to bind the port the running adapter already holds, and the
+// failure would surface as a red deploy against a healthy host. Pin the guard.
+test('importing the module does not start a listener', async () => {
+  const { spawn } = await import('node:child_process');
+  const probePort = 24571;
+  const child = spawn(process.execPath, [
+    '-e',
+    `import(${JSON.stringify(new URL('../src/ws-gateway.mjs', import.meta.url).href)})`
+      + `.then(() => setTimeout(() => process.exit(0), 1500))`,
+  ], { env: { ...process.env, PORT: String(probePort), SSH_PORT: '1' }, stdio: 'ignore' });
+
+  // Probe while the child is still alive: once it exits, the port would be free
+  // even if the guard had fired and bound it.
+  let listening = false;
+  for (let i = 0; i < 10 && !listening; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    listening = await new Promise(resolve => {
+      const probe = net.connect({ host: '127.0.0.1', port: probePort });
+      probe.on('connect', () => { probe.destroy(); resolve(true); });
+      probe.on('error', () => resolve(false));
+    });
+  }
+  const code = await new Promise(resolve => child.on('exit', resolve));
+  assert.equal(code, 0, 'importing the module must exit cleanly');
+  assert.equal(listening, false, 'import must not bind a port');
+});
