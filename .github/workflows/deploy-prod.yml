@@ -25,6 +25,10 @@ jobs:
       GATEWAY_ROOT: /opt/catsco-artifact-gateway
       UNIT: catsco-artifact-gateway-control-plane
       WSS_UNIT: catsco-artifact-gateway-wss-p0
+      # The tunnel limit the adapter must report after a deploy. Kept here so the
+      # deploy fails loudly if the default reverts, instead of only checking that
+      # the field exists. Change this together with DEFAULT_TUNNEL_MAX_CONNECTIONS.
+      EXPECTED_TUNNEL_MAX: "160"
     steps:
       - uses: actions/checkout@v6
 
@@ -94,16 +98,17 @@ jobs:
         # connectors treat that as a normal disconnect and reconnect within a few
         # seconds.
         run: |
+          set -e
           ssh cag "sudo -n systemctl restart $WSS_UNIT"
           sleep 2
           ssh cag "sudo -n systemctl is-active $WSS_UNIT"
           # `/_gateway/health` belongs to the control plane, so it cannot report
           # anything about the adapter. Ask the adapter on its loopback port
-          # instead: the field only exists in the version that reads the limit at
-          # startup, which is what makes this a check that the restart took.
+          # instead, and compare the value rather than only looking for the field:
+          # a deploy that left the limit at its old default would otherwise pass.
           health=$(ssh cag "curl -fsS http://127.0.0.1:22444/health")
           echo "wss health: $health"
-          echo "$health" | grep -q '"maxConnections"'
+          echo "$health" | grep -q "\"maxConnections\":$EXPECTED_TUNNEL_MAX"
 
       - name: Verify
         run: |
