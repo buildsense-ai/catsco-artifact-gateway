@@ -23,14 +23,7 @@ WSS adapter 同时最多承载 `TUNNEL_MAX_CONNECTIONS` 条隧道，默认 **160
 两条相关的调整：
 
 - **提高上限时要同时确认 `LimitNOFILE`。** 每条隧道占 2 个 fd，`ws-gateway.service` 已从 1024 提到 2048；socket 预算不该先于连接上限被撞到。
-- **`ws-gateway.service` 由 CI 之外的一次性安装负责**（`deploy-prod.yml` 只安装 `cag-apply.*` 与 `control-plane.service`）。改了这个 unit 之后，线上要重新安装才生效：
-
-  ```sh
-  install -m 644 deploy/ws-gateway.service /etc/systemd/system/
-  systemctl daemon-reload && systemctl restart catsco-artifact-gateway-wss-p0
-  ```
-
-  连接上限本身写在代码里（默认 160），所以源码更新即生效；只有 unit 里的资源限制需要这一步。
+- **unit 与代码都由 CI 安装和重启。** `deploy-prod.yml` 在每次合并到 main 时会装 `ws-gateway.service` 并重启 WSS adapter，所以改了 unit 或 `src/ws-gateway.mjs` 都会自动生效，不需要手工上机。重启会断开现有隧道，连接器会在几秒内自动重连。
 
 ## 当前试验部署位置
 

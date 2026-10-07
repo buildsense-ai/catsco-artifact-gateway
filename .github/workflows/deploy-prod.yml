@@ -24,6 +24,7 @@ jobs:
     env:
       GATEWAY_ROOT: /opt/catsco-artifact-gateway
       UNIT: catsco-artifact-gateway-control-plane
+      WSS_UNIT: catsco-artifact-gateway-wss-p0
     steps:
       - uses: actions/checkout@v6
 
@@ -61,13 +62,17 @@ jobs:
 
       - name: Install or refresh the units
         # Everything here is idempotent: the root helper, the path unit that
-        # watches gateway.json, and the control-plane unit itself (which needs
-        # ReadWritePaths, or the registration API cannot write its own config).
+        # watches gateway.json, and the two long-running units. The control plane
+        # needs ReadWritePaths, or the registration API cannot write its own
+        # config. The WSS adapter is installed here too, or a change to its limit
+        # would be copied to the host and never take effect: it reads that file
+        # only at startup, and nothing else installs its unit.
         run: |
           ssh cag "set -e
             sudo -n chmod 755 $GATEWAY_ROOT/deploy/apply-config.sh
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/cag-apply.service $GATEWAY_ROOT/deploy/cag-apply.path /etc/systemd/system/
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/control-plane.service /etc/systemd/system/$UNIT.service
+            sudo -n install -m 644 $GATEWAY_ROOT/deploy/ws-gateway.service /etc/systemd/system/$WSS_UNIT.service
             sudo -n systemctl daemon-reload
             sudo -n systemctl enable --now cag-apply.path"
 
@@ -83,12 +88,26 @@ jobs:
           sleep 2
           ssh cag "sudo -n systemctl is-active $UNIT"
 
+      - name: Restart the WSS adapter
+        # The adapter reads TUNNEL_MAX_CONNECTIONS once, at startup, so a copied
+        # source file is not a deployed change. Restarting drops the open tunnels;
+        # connectors treat that as a normal disconnect and reconnect within a few
+        # seconds.
+        run: |
+          ssh cag "sudo -n systemctl restart $WSS_UNIT"
+          sleep 2
+          ssh cag "sudo -n systemctl is-active $WSS_UNIT"
+
       - name: Verify
         run: |
           set -e
           health=$(curl -fsS https://artifact.catsco.cc/_gateway/health)
           echo "health: $health"
           echo "$health" | grep -q '"ok":true'
+          # The adapter must report the limit it actually runs with, so a restart
+          # that silently kept the old process is caught here rather than by a
+          # user whose application cannot connect.
+          echo "$health" | grep -q '"maxConnections"'
           # Registration is a platform-to-gateway call, so it must be reachable
           # from outside on both public domains, and refuse an anonymous caller.
           for host in artifact.catsco.cc artifact.catsco.cn; do
