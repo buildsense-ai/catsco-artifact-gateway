@@ -63,6 +63,30 @@ test('gateway denies shell, local forwards, passwords and root', () => {
   assert.ok(r.locations.includes('proxy_buffering off'));
   assert.ok(r.sshd.includes('ListenAddress 127.0.0.1'));
 });
+test('the tunnel admits as many connections per client as an application route', () => {
+  // One client opens a tunnel per application it publishes, and the tunnel
+  // location is a single route shared by all of them. A ceiling below the
+  // application-route ceiling lets the tunnel run out first, so a client is
+  // refused at the tunnel while its own application routes would still accept
+  // it. Both are per-client (limit_conn_zone $binary_remote_addr), so they are
+  // the same unit and must not disagree.
+  //
+  // The directives are rendered one per line, so a block runs from its opening
+  // line to the closing brace.
+  const lines = renderGateway(g).locations.split('\n');
+  const blockOf = (header) => {
+    const start = lines.findIndex(line => line.includes(header));
+    assert.ok(start >= 0, `${header} must be rendered`);
+    const end = lines.indexOf('}', start);
+    assert.ok(end > start, `${header} must be a closed block`);
+    return lines.slice(start, end + 1).join('\n');
+  };
+  const ceilingOf = (block) => block.match(/limit_conn cag_p0_connections (\d+);/)?.[1];
+  const tunnel = ceilingOf(blockOf('location = /_gateway/tunnel'));
+  const application = ceilingOf(blockOf('location ^~ /demo/'));
+  assert.equal(tunnel, application);
+  assert.equal(tunnel, '20');
+});
 test('reject duplicate routes and configuration injection', () => {
   assert.throws(() => renderGateway({ ...g, apps: [g.apps[0], g.apps[0]] }));
   assert.throws(() => renderGateway({ ...g, hostKey: '/etc/cert;evil' }));
