@@ -152,7 +152,7 @@ const me = await fetch(`https://artifact.catsco.cc/_gateway/me?app=${APP_ID}`, {
 | `viewer.uid` | 平台数字 uid。缺省/非数字时为 `null` |
 | `viewer.username` | **平台账号名**（唯一、不可变）。旧格式凭据下可能为 `null` |
 | `viewer.kind` | 实体类型，当前恒为 `user` |
-| `topic_id` | 用户从哪个会话进来的；直接开网址时为 `null` |
+| `topic_id` | 旧身份接口来源提示，直接开网址时为 `null`；同名 cookie 可被其他打开实例覆盖，不能作为标注目标或会话授权 |
 | `expires_at` | 该身份的到期时间 |
 
 ### 该用哪个字段做权限
@@ -161,7 +161,7 @@ const me = await fetch(`https://artifact.catsco.cc/_gateway/me?app=${APP_ID}`, {
 |---|---|
 | 只在本应用内区分用户、不跨应用关联 | `viewer.id`（推荐，默认） |
 | 要跨应用识别"是同一个人"、或要显示人类可读的账号名 | `viewer.username` / `viewer.uid` |
-| 要按来源会话给不同内容 | `topic_id` |
+| 要展示旧来源提示 | `topic_id`（不能用它隔离会话数据、选择聊天或授权标注） |
 
 `viewer.id` 与 `viewer.username` 是**同一份身份**的两种视图，不是两个用户：一个用户在你的应用里 `id` 固定、`username` 也固定。选哪个是**你要不要跨应用关联**的取舍。
 
@@ -172,7 +172,7 @@ const me = await fetch(`https://artifact.catsco.cc/_gateway/me?app=${APP_ID}`, {
 ```js
 const me = await fetch(gatewayMeURL, { headers: forwardCredentials(req) }).then(r => r.json());
 const viewer = me.authenticated ? me.viewer : null;
-const topic = me.topic_id;                    // 来自哪个会话，可做"按会话隔离"
+const topicHint = me.topic_id;                // 旧来源提示，不能作为会话权限或标注目标
 
 if (!viewer)              return renderGuest();          // 未登录/游客
 if (await isOwner(viewer.id))  return renderAdmin(viewer.username);
@@ -235,6 +235,10 @@ curl -s "https://artifact.catsco.cc/_gateway/me?app=$APP"
 ```
 
 **第 4 条是这套能力的真正验收点**：如果已登录和未登录看到的是同一份内容，说明身份只被显示、没被用于权限。
+
+## 自动标注接入（本轮未部署）
+
+平台发布 API 不接受 runtime activation。新应用与已有应用均默认关闭；管理员需在 gateway.json 为特定 app 设置 annotations:true，并配置全局 annotationRuntime 的固定资源目录与精确 parentOrigins，render/Nginx 校验后才启用。上游 script-src 'self' 允许同 origin 外部 SDK；更严格上游 CSP 会自然阻止，不绕过。见 [部署与联合 fixture](ANNOTATION-RUNTIME.md)。open_ref 仅平台父宿主持有，Gateway viewer cookie 不负责会话选择。
 
 ## 8. 诚实的边界
 

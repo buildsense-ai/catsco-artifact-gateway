@@ -1178,6 +1178,25 @@ test('re-registering an application keeps its remote port and its title', async 
   }, config);
 });
 
+test('registration cannot enable runtime and preserves operator-owned annotation opt-in', async () => {
+  const config = registrationConfig();
+  config.content.annotationRuntime = { enabled: true, directory: '/opt/cag/runtime', parentOrigins: ['https://app.example.cc'] };
+  fs.writeFileSync(config.file, JSON.stringify(config.content));
+  await withServer(async ({ base }) => {
+    const first = await apps(base, { method: 'POST', body: registration({ annotations: true }) });
+    assert.equal(first.status, 201);
+    assert.equal(config.read().apps.find(app => app.id === 'board').annotations, undefined, 'API caller cannot opt itself in');
+    const approved = config.read();
+    approved.apps.find(app => app.id === 'board').annotations = true;
+    fs.writeFileSync(config.file, JSON.stringify(approved));
+    const update = await apps(base, { method: 'POST', body: registration({ title: 'Updated', annotations: false }) });
+    assert.equal(update.status, 201);
+    assert.equal(config.read().apps.find(app => app.id === 'board').annotations, true);
+    assert.deepEqual(config.read().annotationRuntime, config.content.annotationRuntime);
+    assert.ok(renderGateway(config.read()).locations.includes('sub_filter'));
+  }, config);
+});
+
 test('an application cannot be taken over by re-registering its id', async () => {
   // An update replaces the entry by id, so a caller that skipped its own
   // ownership check could otherwise move another account's application — and the

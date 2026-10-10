@@ -51,10 +51,13 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
 
-      - name: Upload the source
+      - name: Verify the annotation runtime manifest
+        run: node --test test/annotation-runtime.test.mjs
+
+      - name: Upload the source and fixed annotation runtime
         run: |
-          tar -czf - src scripts deploy docs package.json package-lock.json README.md \
-            | ssh cag "sudo -n tar -xzf - -C $GATEWAY_ROOT && sudo -n chown -R root:root $GATEWAY_ROOT/src $GATEWAY_ROOT/scripts $GATEWAY_ROOT/deploy $GATEWAY_ROOT/docs $GATEWAY_ROOT/package.json $GATEWAY_ROOT/package-lock.json $GATEWAY_ROOT/README.md"
+          tar -czf - src scripts deploy docs public/runtime package.json package-lock.json README.md \
+            | ssh cag "sudo -n tar -xzf - -C $GATEWAY_ROOT && sudo -n chown -R root:root $GATEWAY_ROOT/src $GATEWAY_ROOT/scripts $GATEWAY_ROOT/deploy $GATEWAY_ROOT/docs $GATEWAY_ROOT/public/runtime $GATEWAY_ROOT/package.json $GATEWAY_ROOT/package-lock.json $GATEWAY_ROOT/README.md && sudo -n chmod 755 $GATEWAY_ROOT/public $GATEWAY_ROOT/public/runtime && sudo -n find $GATEWAY_ROOT/public/runtime -type f -exec chmod 644 {} +"
 
       - name: Ensure the runtime dependency is present
         # The gateway is a plain node process; `ws` is its only dependency and it is

@@ -25,7 +25,7 @@ strings. The server keeps four fields per record and nothing else:
 |---|---|
 | `app` | application the ticket is valid for |
 | `sub` | application-scoped pseudonym (`ap_…`, HMAC of secret + app + uid) |
-| `topic` | CatsCompany topic the entry came from, or null |
+| `topic` | legacy entry context hint, or null; never annotation routing authority |
 | `exp` | expiry; one-time records additionally carry `used` |
 
 There is no signature, no version field, no issuer metadata and no key
@@ -45,6 +45,8 @@ share the origin.
   "expires_at": "2026-10-17T04:00:00.000Z"
 }
 ```
+
+For annotations, the gateway cookie identifies a viewer only. Its legacy topic may be overwritten by another open/tab and cannot choose a message destination. The platform host alone holds open_ref and submits to its authenticated bound endpoint; no open_ref enters this gateway store or HTML. Runtime is a separate operator opt-in; see [ANNOTATION-RUNTIME.md](ANNOTATION-RUNTIME.md).
 
 Guest access returns `authenticated: false` with `viewer: null`. A credential
 that is present but invalid returns `401`, so an application can re-launch
