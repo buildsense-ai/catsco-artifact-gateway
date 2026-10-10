@@ -238,7 +238,7 @@ curl -s "https://artifact.catsco.cc/_gateway/me?app=$APP"
 
 ## 自动标注接入（本轮未部署）
 
-平台发布 API 不接受 runtime activation。新应用与已有应用均默认关闭；管理员需在 gateway.json 为特定 app 设置 annotations:true，并配置全局 annotationRuntime 的固定资源目录与精确 parentOrigins，render/Nginx 校验后才启用。上游 script-src 'self' 允许同 origin 外部 SDK；更严格上游 CSP 会自然阻止，不绕过。见 [部署与联合 fixture](ANNOTATION-RUNTIME.md)。open_ref 仅平台父宿主持有，Gateway viewer cookie 不负责会话选择。
+平台发布 API 不接受 runtime activation。管理员配置全局 annotationRuntime 的固定资源目录、精确 parentOrigins 和 defaultEnabled:true 后，未明确关闭的现有与新注册应用默认注入；单应用 annotations:false 覆盖关闭。省略 defaultEnabled 时保留逐应用 annotations:true 的 opt-in 行为。变更需 render/Nginx 校验后应用。上游 script-src 'self' 允许同 origin 外部 SDK；更严格上游 CSP 会自然阻止，不绕过。见 [部署与联合 fixture](ANNOTATION-RUNTIME.md)。open_ref 仅平台父宿主持有，Gateway viewer cookie 不负责会话选择。
 
 ## 8. 诚实的边界
 

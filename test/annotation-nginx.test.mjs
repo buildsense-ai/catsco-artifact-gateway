@@ -71,7 +71,7 @@ test('real rendered nginx: injection, static runtime, compression, CSP and bypas
   let started = false;
   try {
     const appPort = server.address().port;
-    const config = { sshPort: 22443, user: 'cag', publicHosts: ['artifact.catsco.cc'], hostKey: '/etc/cag/key', authorizedKeys: '/etc/cag/keys', annotationRuntime: { enabled: true, directory: '/runtime', parentOrigins: ['https://app.catsco.cc'] }, apps: [{ id: 'demo', remotePort: appPort, publicKey: 'ssh-ed25519 AAAATEST', annotations: true }, { id: 'plain', remotePort: appPort + 1, publicKey: 'ssh-ed25519 AAAAOTHER' }] };
+    const config = { sshPort: 22443, user: 'cag', publicHosts: ['artifact.catsco.cc'], hostKey: '/etc/cag/key', authorizedKeys: '/etc/cag/keys', annotationRuntime: { enabled: true, defaultEnabled: true, directory: '/runtime', parentOrigins: ['https://app.catsco.cc'] }, apps: [{ id: 'demo', remotePort: appPort, publicKey: 'ssh-ed25519 AAAATEST' }, { id: 'plain', remotePort: appPort + 1, publicKey: 'ssh-ed25519 AAAAOTHER', annotations: false }] };
     const out = renderGateway(config);
     // A container's loopback is not the test host. Only change transport target;
     // injection/filter/resource/header directives are the real renderer output.

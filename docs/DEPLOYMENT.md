@@ -50,7 +50,7 @@ systemctl daemon-reload && systemctl enable --now cag-apply.path
 
 ## 可选自动标注 runtime（本轮未部署）
 
-见 [ANNOTATION-RUNTIME.md](ANNOTATION-RUNTIME.md) 的完整 opt-in、源 SDK export/check、过滤/压缩/CSP、Nginx render/install 和专属回滚步骤。全局 annotationRuntime 与每 app annotations:true 均须管理员明确配置，现有应用及新注册应用缺省不启用。先安装可读且 operator-owned 的固定 runtime asset，再应用两份 Nginx 配置；无需新增 proxy 或重启 SSH 服务。
+见 [ANNOTATION-RUNTIME.md](ANNOTATION-RUNTIME.md) 的完整 opt-in、源 SDK export/check、过滤/压缩/CSP、Nginx render/install 和专属回滚步骤。全局 annotationRuntime 由管理员配置；`defaultEnabled:true` 为未明确关闭的现有和新注册应用默认注入，单应用 `annotations:false` 可覆盖关闭。省略 defaultEnabled 时保留逐应用 annotations:true 的 opt-in 行为。先安装可读且 operator-owned 的固定 runtime asset，再应用两份 Nginx 配置；无需新增 proxy 或重启 SSH 服务。
 
 ## 回滚（保留数据）
 

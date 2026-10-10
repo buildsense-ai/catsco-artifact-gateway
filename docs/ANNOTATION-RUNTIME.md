@@ -1,23 +1,24 @@
-# Gateway 自动标注 runtime（未部署）
+# Gateway 自动标注 runtime
 
 真实链路仍为浏览器 → Nginx 应用 location → SSH loopback forward → Bot 应用。`src/gateway-config.mjs` 在现有 location 配置 `sub_filter`；control-plane 仍负责发布、列表、身份交换，不读取 HTML，也没有新增 HTML proxy。
 
-## 配置：两层 opt-in
+## 配置：全局默认与应用覆盖
 
-管理员在真实 `gateway.json` 中设置全局资源/parent allowlist，再选择应用。缺省完全关闭，应用注册 API 不能自行开启；重复注册会保留管理员的 `annotations` 字段。
+管理员设置全局资源和 parent allowlist。`enabled` 控制运行时；`defaultEnabled: true` 使所有未明确关闭的现有与新注册应用自动注入。省略 `defaultEnabled` 时保留逐应用 opt-in 行为。应用注册 API 无权修改这两个开关或单应用覆盖；重复注册保留管理员设置。
 
 ```json
 {
   "annotationRuntime": {
     "enabled": true,
+    "defaultEnabled": true,
     "directory": "/opt/catsco-artifact-gateway/public/runtime",
     "parentOrigins": ["https://app.catsco.cc", "https://app.catsco.cn"]
   },
-  "apps": [{ "id": "existing-app", "annotations": true }]
+  "apps": [{ "id": "excluded-app", "annotations": false }]
 }
 ```
 
-示例 apps 项只是要合并的字段，需保留已有 agent/remotePort/publicKey 等值。现有应用不会自动全开；每个想接入的已存在 app 需管理员设置 `annotations: true`。新平台注册的 app 默认 off：先正常发布取得稳定 app id，再由管理员在 gateway.json 对该 id 添加字段并 render/reload。平台 artifactAppRequest 不需要新增 activation 字段，控制面忽略 caller 的 annotations，并保留已批准 flag。allowlist 是显式精确 origin（最多 32 个、JSON ≤16384 字符），生产只接受 HTTPS；本地 loopback HTTP 可用于 fixture。不能包含通配符、路径、query、credential。配置不从 referrer、URL、shared viewer cookie 推断 parent/topic。
+示例 apps 项只是要合并的字段，需保留已有 agent/remotePort/publicKey 等值。全局默认开启时，不需要逐应用添加 `annotations: true`；新注册应用自动继承，`annotations: false` 明确关闭某应用。平台 artifactAppRequest 不需要新增 activation 字段，控制面忽略 caller 的 annotations，并保留管理员覆盖。allowlist 是显式精确 origin（最多 32 个、JSON ≤16384 字符），生产只接受 HTTPS；本地 loopback HTTP 可用于 fixture。不能包含通配符、路径、query、credential。配置不从 referrer、URL、shared viewer cookie 推断 parent/topic。
 
 注入固定同 origin classic script：
 

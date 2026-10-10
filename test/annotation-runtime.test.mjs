@@ -26,6 +26,18 @@ test('runtime and each application require independent explicit opt-in', () => {
   assert.ok(plain.includes('proxy_pass http://127.0.0.1:28192/'));
 });
 
+test('operator default enables existing and future apps while explicit opt-out is retained', () => {
+  const config = { ...gateway, annotationRuntime: { ...runtime, defaultEnabled: true },
+    apps: [...gateway.apps, { id: 'off', remotePort: 28193, publicKey: 'ssh-ed25519 AAAAOFF off', annotations: false }] };
+  const out = renderGateway(config);
+  assert.equal((out.locations.match(/sub_filter_once on/g) || []).length, 2);
+  assert.ok(out.locations.split('location ^~ /plain/')[1].split('location = /off')[0].includes('sub_filter'));
+  assert.ok(!out.locations.split('location ^~ /off/')[1].includes('sub_filter'));
+  assert.equal(out.sshd, renderGateway({ ...config, annotationRuntime: undefined }).sshd);
+  assert.equal(out.authorizedKeys, renderGateway({ ...config, annotationRuntime: undefined }).authorizedKeys);
+  for (const defaultEnabled of ['true', 1, null]) assert.throws(() => annotationRuntime({ annotationRuntime: { ...runtime, defaultEnabled } }));
+});
+
 test('parent allowlist and fixed asset paths reject executable/config injection', () => {
   for (const origin of ['*', 'null', 'https://app.catsco.cc/', 'https://app.catsco.cc/path', 'https://user:pass@app.catsco.cc', 'https://app.catsco.cc?x', 'http://app.catsco.cc', "https://evil';foo", 'https://app.catsco.cc\n', 42]) {
     assert.throws(() => annotationRuntime({ annotationRuntime: { ...runtime, parentOrigins: [origin] } }), String(origin));

@@ -21,8 +21,9 @@ export function annotationRuntime(config) {
   const value = config.annotationRuntime;
   if (value === undefined) return null;
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid annotationRuntime');
-  if (Object.keys(value).some(key => !['enabled', 'directory', 'parentOrigins'].includes(key))) throw new Error('Unknown annotationRuntime setting');
+  if (Object.keys(value).some(key => !['enabled', 'directory', 'parentOrigins', 'defaultEnabled'].includes(key))) throw new Error('Unknown annotationRuntime setting');
   if (typeof value.enabled !== 'boolean') throw new Error('annotationRuntime.enabled must be boolean');
+  if (value.defaultEnabled !== undefined && typeof value.defaultEnabled !== 'boolean') throw new Error('annotationRuntime.defaultEnabled must be boolean');
   if (!value.enabled) return null;
   if (typeof value.directory !== 'string' || !/^\/[a-zA-Z0-9/_.-]+$/.test(value.directory) || value.directory.split('/').includes('..')) throw new Error('Invalid annotation runtime directory');
   if (!Array.isArray(value.parentOrigins) || !value.parentOrigins.length || value.parentOrigins.length > 32) throw new Error('Explicit annotation parentOrigins required');
@@ -30,7 +31,7 @@ export function annotationRuntime(config) {
   if (JSON.stringify(origins).length > 16384) throw new Error('Annotation parentOrigins exceeds SDK config bound');
   const directory = value.directory.replace(/\/+$/, '');
   if (!directory) throw new Error('Invalid annotation runtime directory');
-  return { directory, origins };
+  return { directory, origins, defaultEnabled: value.defaultEnabled === true };
 }
 
 export function validateAppAnnotations(app) {
