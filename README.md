@@ -1,6 +1,6 @@
 # catsco-artifact-gateway
 
-独立的轻 Artifact **P0 链路原型**：把 Bot 本地 HTTP 应用经出站 443 暴露出来，不要求 Bot 用户拥有 root 或公网 IP。
+独立的轻 Artifact Gateway：把 Bot 本地 HTTP 应用经出站 443 暴露出来，不要求 Bot 用户拥有 root 或公网 IP。现有 Nginx + SSH/WSS 传输提供应用路由，control-plane 提供注册、列表和身份交换；管理员可 opt-in 同 origin 外部标注 runtime（本轮代码未部署）。
 
 ## 实际链路
 
@@ -32,9 +32,10 @@ Bot 本地应用 ← OpenSSH 客户端 ← WSS 443 ← 独立 sshd + WSS adapter
 ## 本地校验
 
 ```sh
-npm ci
-npm test
-npm audit --omit=dev --registry=https://registry.npmjs.org
+pnpm install --ignore-scripts --lockfile=false
+pnpm test
+# 已有 Docker + nginx:alpine 时，运行真实 Nginx -t/HTTP/WS 注入测试
+CAG_NGINX_TEST=1 pnpm test
 ```
 
 ## Bot 侧初始化（以 Agent 用户执行）
@@ -80,11 +81,11 @@ node scripts/local-demo.mjs stop /absolute/user/state/connector.json
 
 ## 明确不包含
 
-1. 不包含会话注入、账户身份、Bot 自动注册，未修改 XiaoBa/CatsCompany 核心。
+1. 应用注册/列表/账户身份由现有 control-plane 提供。自动标注 runtime 由真实 Nginx 响应注入，见 [配置、过滤条件、SDK 导出、部署/回滚与联合 fixture](docs/ANNOTATION-RUNTIME.md)。会话 open_ref 由 CatsCo 父宿主保存、平台验证，Gateway 不读取或注入它，也不按 viewer cookie 选聊天。
 2. 不包含新 Artifact 列表 UI 或旧 Artifact 删除。旧系统保持运行。
-3. 目前管理员登记应用，尚不是自助一键发布 API。
+3. 发布者通过平台 API 注册应用，平台用 control token 调用 Gateway；管理员仍负责 runtime opt-in 与 parent allowlist。
 4. 独立双域名 `artifact.catsco.cc`、`artifact.catsco.cn` 使用 `/<app-id>/` 路径；两个域名无强制跳转，均可访问全部应用。**不是多应用浏览器安全隔离方案**：共享 origin 的 localStorage 等仍共享。只部署本仓库可信、可丢弃 demo；禁止上传任意 Agent 生成的页面。如需运行互不信任的应用，必须另行解决应用间浏览器隔离；路径本身不是隔离边界。
-5. P0 会剥离 Cookie/Set-Cookie，并施加一套 CSP 响应头；请求体上限默认 1MB，应用可自行声明到 256MB。不支持应用登录 Cookie。正式隔离域名完成后再定义这些策略。
+5. 应用路径保留 Cookie/Set-Cookie；tunnel/control ingress 按现有规则剥离。Gateway 添加原有 CSP，并保留上游 CSP 的额外限制，runtime 不放宽它。请求体上限默认 1MB，应用可自行声明到 256MB。HTML opt-in 注入仅适用有长度、≤999999 bytes 的 UTF8/ASCII 文档；chunked/强制压缩/下载等跳过，详见 runtime 文档。
 6. SSH+WSS 会增加进程数与加密开销，尚未压力测试。每应用一个连接只是两机验证方案。
 7. 网络只需出站 443，但仍需允许 WebSocket；强制企业代理/拦截场景未验证。
 8. 公网 demo 计数器有意匿名可写，只用于测试，不存用户数据或凭据。

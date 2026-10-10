@@ -693,6 +693,9 @@ export function createControlPlane({
       // the value, so a declaration above the ceiling is refused as an invalid
       // registration instead of being stored.
       maxBody: text(body.maxBody) ?? previous?.maxBody,
+      // Annotation opt-in is operator-owned gateway configuration. Publishing
+      // or updating an app must neither enable it nor erase an existing flag.
+      annotations: previous?.annotations,
     };
     // Same rule as the title: an update that does not send a local port keeps
     // the recorded one, so rotating a key cannot erase what the connector was

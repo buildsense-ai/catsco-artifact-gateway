@@ -66,6 +66,8 @@ const entry = {
   // field is what makes the ceiling survive the next apply, which re-renders
   // the nginx include from this file.
   maxBody: registration.maxBody ?? previous?.maxBody,
+  // Registration is not an operator approval to inject runtime code.
+  annotations: previous?.annotations,
 };
 const others = (config.apps || []).filter(app => app.id !== entry.id);
 if (others.some(app => app.remotePort === entry.remotePort)) throw new Error(`Port ${entry.remotePort} is already registered`);

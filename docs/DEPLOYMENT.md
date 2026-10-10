@@ -3,7 +3,7 @@
 ## Gateway 系统侧
 
 1. 创建仅用于认证的系统用户 `cag_ingress`，不授予 sudo；生成专用 sshd 主机密钥，不复用管理 SSH 密钥。
-2. 应用文件安装到 `/opt/catsco-artifact-gateway`，运行 `npm ci --omit=dev`。
+2. 应用文件安装到 `/opt/catsco-artifact-gateway`，运行 `pnpm install --prod --ignore-scripts --lockfile=false`。
 3. 配置和密钥置于 `/etc/catsco-artifact-gateway`。host private key 0600 root-owned，authorized_keys 是公钥文件，0644 root-owned。Bot 私钥绝不复制到网关。
 4. 渲染配置，检查后安装 `deploy/gateway.service` 与 `deploy/ws-gateway.service` 为独立 systemd 单元。
 5. 在 Nginx http 上下文加载生成的 `nginx`，在独立 Artifact HTTPS server 中 include 生成的 `locations`。配置 `publicHosts` 为全部域名，参考 `deploy/artifact-nginx.conf`；先建立 HTTP ACME challenge 路由，再申请独立 SAN 证书，最后启用 HTTPS。先备份原配置、比较防止覆盖他人变更，再 `nginx -t`，通过才 reload。
@@ -47,6 +47,10 @@ systemctl daemon-reload && systemctl enable --now cag-apply.path
 `cag-apply.path` 监听 `gateway.json` 变化 → `cag-apply.service` 渲染四个文件：`nginx -t` 通过才 reload nginx，`sshd -t` 通过才 restart `catsco-artifact-gateway-p0`。不通过就不动正在跑的服务，因此不需要回滚框架。`cag_ingress` 仍然没有 sudo，root 侧只对一个「本来就只有它可写」的文件做出反应，攻击面等于原来的 `scripts/register-app.mjs`。
 
 文件名与实际路径映射（2026-09-20 在 catsco-prod 只读确认）：`sshd`→`/etc/catsco-artifact-gateway/sshd`、`authorizedKeys`→`/etc/catsco-artifact-gateway/authorized_keys`、`locations`→`/etc/catsco-artifact-gateway/artifact-locations.conf`、`nginx`→`/etc/nginx/conf.d/catsco-artifact-gateway-p0.conf`。
+
+## 可选自动标注 runtime（本轮未部署）
+
+见 [ANNOTATION-RUNTIME.md](ANNOTATION-RUNTIME.md) 的完整 opt-in、源 SDK export/check、过滤/压缩/CSP、Nginx render/install 和专属回滚步骤。全局 annotationRuntime 由管理员配置；`defaultEnabled:true` 为未明确关闭的现有和新注册应用默认注入，单应用 `annotations:false` 可覆盖关闭。省略 defaultEnabled 时保留逐应用 annotations:true 的 opt-in 行为。先安装可读且 operator-owned 的固定 runtime asset，再应用两份 Nginx 配置；无需新增 proxy 或重启 SSH 服务。
 
 ## 回滚（保留数据）
 
