@@ -15,7 +15,7 @@ import { renderGateway } from '../src/gateway-config.mjs';
 
 const html = '<!doctype html><html><head lang="en"><title>fixture</title></head><body><button id="pick">Hello</button></body></html>';
 const scriptPath = '/_catsco/runtime/annotations-v1.js';
-const rendererPath = '/_catsco/runtime/html2canvas-1.4.1.min.js';
+const rendererPath = '/_catsco/runtime/html2canvas-pro-1.6.7.min.js';
 const image = process.env.CAG_NGINX_IMAGE || 'nginx:alpine';
 // Only for a pre-freeze route rehearsal against an explicitly staged asset
 // directory; the shipped assertions always use the exported vendor directory.
@@ -140,12 +140,15 @@ test('real rendered nginx: injection, static runtime, compression, CSP and bypas
     assert.equal(renderer.headers['content-encoding'], undefined);
     assert.equal(renderer.headers['content-length'], String(renderer.body.length));
     assert.equal(renderer.headers['set-cookie'], undefined);
-    assert.deepEqual(renderer.body, fs.readFileSync(path.join(runtimeDir, 'html2canvas-1.4.1.min.js')));
-    assert.ok(renderer.body.toString().includes('html2canvas 1.4.1'));
+    assert.deepEqual(renderer.body, fs.readFileSync(path.join(runtimeDir, 'html2canvas-pro-1.6.7.min.js')));
+    assert.ok(renderer.body.toString().includes('html2canvas-pro 1.6.7'));
     assert.equal((await request(base, rendererPath, { 'If-None-Match': renderer.headers.etag })).status, 304);
     assert.equal((await request(base, rendererPath, {}, 'HEAD')).status, 200);
     assert.equal((await request(base, rendererPath, {}, 'POST')).status, 403);
-    for (const url of ['/_catsco/runtime/html2canvas-1.4.0.min.js', '/_catsco/runtime/html2canvas-1.4.1.LICENSE', '/_catsco/runtime/html2canvas-1.4.1.min.js/extra']) assert.equal((await request(base, url)).status, 404);
+    const legacy = await request(base, '/_catsco/runtime/html2canvas-1.4.1.min.js');
+    assert.equal(legacy.status, 200, 'already-open old SDKs retain their fixed renderer');
+    assert.deepEqual(legacy.body, fs.readFileSync(path.join(runtimeDir, 'html2canvas-1.4.1.min.js')));
+    for (const url of ['/_catsco/runtime/html2canvas-1.4.0.min.js', '/_catsco/runtime/html2canvas-pro-1.6.7.LICENSE', '/_catsco/runtime/html2canvas-pro-1.6.7.min.js/extra']) assert.equal((await request(base, url)).status, 404);
     t.diagnostic(JSON.stringify({ renderer_status: renderer.status, renderer_bytes: renderer.body.length, renderer_sha256: createHash('sha256').update(renderer.body).digest('hex'), type: renderer.headers['content-type'], cache_control: renderer.headers['cache-control'], nosniff: renderer.headers['x-content-type-options'], source: 'fixed same-origin alias, no CDN proxy' }));
     await new Promise((resolve, reject) => {
       const socket = new WebSocket(base.replace('http:', 'ws:') + '/demo/socket');

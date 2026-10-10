@@ -2,8 +2,12 @@
 // application proxy; the control plane never sees or rewrites app documents.
 export const RUNTIME_URL = '/_catsco/runtime/annotations-v1.js';
 export const RUNTIME_FILENAME = 'annotations-v1.js';
-export const RENDERER_URL = '/_catsco/runtime/html2canvas-1.4.1.min.js';
-export const RENDERER_FILENAME = 'html2canvas-1.4.1.min.js';
+export const RENDERER_URL = '/_catsco/runtime/html2canvas-pro-1.6.7.min.js';
+export const RENDERER_FILENAME = 'html2canvas-pro-1.6.7.min.js';
+// Already-open documents still contain the old SDK's fixed renderer URL.
+// Preserve its exact alias while reloads adopt the new SDK and modern colors.
+const LEGACY_RENDERER_URL = '/_catsco/runtime/html2canvas-1.4.1.min.js';
+const LEGACY_RENDERER_FILENAME = 'html2canvas-1.4.1.min.js';
 export const MAX_HTML_BYTES = 999999;
 
 function parentOrigin(value) {
@@ -78,7 +82,7 @@ map $cag_annotation_eligible $cag_annotation_body { default ""; 1 "</body>"; }
 export function runtimeLocation(runtime) {
   // Keep the executable resource set explicit, independent of request/query or
   // manifest data. Renderer is loaded on demand by the canonical SDK.
-  return [[RUNTIME_URL, RUNTIME_FILENAME], [RENDERER_URL, RENDERER_FILENAME]].map(([url, filename]) => `# Fixed vendored asset only. No user-selected path, upstream URL or token.
+  return [[RUNTIME_URL, RUNTIME_FILENAME], [RENDERER_URL, RENDERER_FILENAME], [LEGACY_RENDERER_URL, LEGACY_RENDERER_FILENAME]].map(([url, filename]) => `# Fixed vendored asset only. No user-selected path, upstream URL or token.
 location = ${url} {
  alias ${runtime.directory}/${filename};
  types { } default_type application/javascript;

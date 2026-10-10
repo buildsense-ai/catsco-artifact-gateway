@@ -40,7 +40,7 @@ SDK 首个来自 `window.parent` + allowlist origin 的有效 connect 创建 sin
 - 上游按要求返回未压缩 HTML 时自动注入；下游 Nginx gzip（如果已配置）在替换之后执行。若上游无视协商强制 gzip/br，filter map 为空，压缩体/Content-Encoding/Content-Length 原样通过，**没有注入**。不会 gunzip 未知体或添加解压代理。
 - chunked HTML、没有 Content-Length 的 HTML/SSE、超限体、非 UTF8/ASCII、下载（任何 Content-Disposition）、JSON/CSS/JS/xhtml、206/range/error/HEAD 均不注入。下载/强制 gzip 的 byte/header 保留；应用 no-store 是已有 gateway 策略。
 - 上游 Content-Security-Policy 和 Report-Only 全部保留，与 gateway 原有 CSP 同时生效；没有新增 unsafe-inline/unsafe-eval 或覆盖 CSP。script-src 禁止 self 时 runtime 被浏览器自然阻止，宿主应显示 SDK unavailable。style CSP 仍可限制 SDK affordance；不放宽它。HTTP 测试证明 header 保留，浏览器 CSP enforcement 由联合浏览器验收确认。
-- `/_catsco/runtime/annotations-v1.js` 和 `/_catsco/runtime/html2canvas-1.4.1.min.js` 两个 exact location 只 alias 管理员部署的固定文件，不代理 query/用户 URL。SDK 在截图请求时按需加载同源固定 renderer，不使用 CDN。GET/HEAD 可读，其他方法拒绝，其他 runtime 路径 404，manifest 与许可证不公开（许可证保留在部署目录）。Content-Type application/javascript、nosniff、no-referrer，资源 Cache-Control public,max-age=0,must-revalidate + ETag。v1 是协议版本而非内容 hash，不能配置 immutable 长缓存。
+- `/_catsco/runtime/annotations-v1.js`、`/_catsco/runtime/html2canvas-pro-1.6.7.min.js`，以及兼容已打开旧 SDK 的 `/_catsco/runtime/html2canvas-1.4.1.min.js` 三个 exact location 只 alias 管理员部署的固定文件，不代理 query/用户 URL。新版 SDK 在截图请求时按需加载同源固定 html2canvas-pro 1.6.7 renderer 并校验 SRI，支持现代 CSS 颜色；不使用 CDN。旧文档须重新加载应用 iframe 后采用新 SDK。GET/HEAD 可读，其他方法拒绝，其他 runtime 路径 404，manifest 与许可证不公开（许可证保留在部署目录）。Content-Type application/javascript、nosniff、no-referrer，资源 Cache-Control public,max-age=0,must-revalidate + ETag。v1 是协议版本而非内容 hash，不能配置 immutable 长缓存。
 
 Content-Length 是上游提供的界限；Nginx 此方案没有全体 buffering，也无法证明恶意上游声明与实际字节一致。仅用于当前可信应用，路径共享 origin 仍不是安全隔离边界。
 
