@@ -17,9 +17,10 @@ test('runtime and each application require independent explicit opt-in', () => {
   }
   const out = renderGateway({ ...gateway, annotationRuntime: runtime });
   assert.ok(out.locations.includes('location = /_catsco/runtime/annotations-v1.js'));
+  assert.ok(out.locations.includes('location = /_catsco/runtime/html2canvas-pro-1.6.7.min.js'));
+  assert.ok(out.locations.includes(`alias ${runtime.directory}/html2canvas-pro-1.6.7.min.js;`));
   assert.ok(out.locations.includes('location = /_catsco/runtime/html2canvas-1.4.1.min.js'));
-  assert.ok(out.locations.includes(`alias ${runtime.directory}/html2canvas-1.4.1.min.js;`));
-  assert.equal((out.locations.match(/location = \/_catsco\/runtime\//g) || []).length, 2, 'only the two pinned executable assets');
+  assert.equal((out.locations.match(/location = \/_catsco\/runtime\//g) || []).length, 3, 'SDK, current renderer and compatibility renderer only');
   const [annotated, plain] = out.locations.split('location ^~ /demo/')[1].split('location = /plain');
   assert.ok(annotated.includes('sub_filter'));
   assert.ok(!plain.includes('sub_filter'));
@@ -73,7 +74,7 @@ test('vendored runtime bytes agree with deterministic SDK export manifest', () =
   assert.equal(manifest.bytes, bytes.length);
   assert.equal(manifest.sha256, createHash('sha256').update(bytes).digest('hex'));
   assert.ok(bytes.toString().includes('bootstrapAttribute'));
-  assert.deepEqual(manifest.resources.map(resource => resource.filename), ['annotations-v1.js', 'html2canvas-1.4.1.min.js', 'html2canvas-1.4.1.LICENSE']);
+  assert.deepEqual(manifest.resources.map(resource => resource.filename), ['annotations-v1.js', 'html2canvas-pro-1.6.7.min.js', 'html2canvas-pro-1.6.7.LICENSE', 'html2canvas-1.4.1.min.js', 'html2canvas-1.4.1.LICENSE']);
   for (const resource of manifest.resources) {
     const data = fs.readFileSync(new URL(resource.filename, dir));
     assert.equal(resource.runtime_path, '/_catsco/runtime/' + resource.filename);
@@ -81,14 +82,18 @@ test('vendored runtime bytes agree with deterministic SDK export manifest', () =
     assert.equal(resource.sha256, createHash('sha256').update(data).digest('hex'));
     assert.equal(resource.mime_type, resource.filename.endsWith('.js') ? 'application/javascript' : 'text/plain');
   }
-  assert.equal(manifest.resources[1].sha256, 'e87e550794322e574a1fda0c1549a3c70dae5a93d9113417a429016838eab8cb');
-  assert.equal(manifest.resources[2].sha256, '86200ce4e92d9a22c41c8647a55f7a5fddff304ff89b4d36ecc699ed8c123d2c');
-  const renderer = fs.readFileSync(new URL('html2canvas-1.4.1.min.js', dir));
-  assert.ok(renderer.toString().includes('html2canvas 1.4.1'));
-  const license = fs.readFileSync(new URL('html2canvas-1.4.1.LICENSE', dir), 'utf8');
+  assert.equal(manifest.resources[3].sha256, 'e87e550794322e574a1fda0c1549a3c70dae5a93d9113417a429016838eab8cb');
+  assert.equal(manifest.resources[4].sha256, '86200ce4e92d9a22c41c8647a55f7a5fddff304ff89b4d36ecc699ed8c123d2c');
+  assert.equal(manifest.resources[1].sha256, 'bacbbb275f41a08e6eb4db0c5b44d9477546186d3078757577f4205147d1814f');
+  assert.equal(manifest.resources[2].sha256, '04092b9193d5ef3c611d82509387a6341447dccbe2330716884383c4dc9c568a');
+  const renderer = fs.readFileSync(new URL('html2canvas-pro-1.6.7.min.js', dir));
+  assert.ok(renderer.toString().includes('html2canvas-pro 1.6.7'));
+  const license = fs.readFileSync(new URL('html2canvas-pro-1.6.7.LICENSE', dir), 'utf8');
   assert.ok(license.includes('MIT'));
-  assert.ok(bytes.toString().includes('/_catsco/runtime/html2canvas-1.4.1.min.js'), 'SDK loads only the pinned self-host renderer');
+  assert.ok(license.includes('yorickshan'));
+  assert.ok(license.includes('Niklas von Hertzen'));
+  assert.ok(bytes.toString().includes('/_catsco/runtime/html2canvas-pro-1.6.7.min.js'), 'SDK loads only the pinned self-host renderer');
   assert.ok(!/cdn\.|unpkg|jsdelivr|cdnjs/i.test(bytes.toString()), 'no CDN renderer URL may appear in the SDK');
-  assert.ok(bytes.toString().includes('sha384-ZZ1pncU3bQe8y31yfZdMFdSpttDoPmOZg2wguVK9almUodir1PghgT0eY7Mrty8H'), 'renderer SRI pin is part of the served bytes');
+  assert.ok(bytes.toString().includes('sha384-CqHBfwlOY3BunFNI9xxzy+h/+/df5g0tI05vSbd8kIwTTPk23b5jYDpyrlxfukc+'), 'renderer SRI pin is part of the served bytes');
   assert.ok(bytes.toString().includes('catsco.gateway.annotation.screenshot.result.v1'));
 });

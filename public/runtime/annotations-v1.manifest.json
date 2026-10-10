@@ -3,16 +3,32 @@
   "runtime_path": "/_catsco/runtime/annotations-v1.js",
   "config_attribute": "data-catsco-parent-origins",
   "source": "webapp/public/catsco-annotations.js",
-  "sha256": "97f38f238e7784ab78a563b37d2a132432374811c37ad3ad40cecc9ba0a71128",
-  "bytes": 58523,
+  "sha256": "d0e1174657a3b85f82d39bbb73c9a7a86eb3924e2422eee00f9b2f8e9ba9e522",
+  "bytes": 59735,
   "resources": [
     {
       "filename": "annotations-v1.js",
       "runtime_path": "/_catsco/runtime/annotations-v1.js",
       "source": "webapp/public/catsco-annotations.js",
-      "sha256": "97f38f238e7784ab78a563b37d2a132432374811c37ad3ad40cecc9ba0a71128",
-      "bytes": 58523,
+      "sha256": "d0e1174657a3b85f82d39bbb73c9a7a86eb3924e2422eee00f9b2f8e9ba9e522",
+      "bytes": 59735,
       "mime_type": "application/javascript"
+    },
+    {
+      "filename": "html2canvas-pro-1.6.7.min.js",
+      "runtime_path": "/_catsco/runtime/html2canvas-pro-1.6.7.min.js",
+      "source": "webapp/public/catsco-runtime/html2canvas-pro-1.6.7.min.js",
+      "sha256": "bacbbb275f41a08e6eb4db0c5b44d9477546186d3078757577f4205147d1814f",
+      "bytes": 206925,
+      "mime_type": "application/javascript"
+    },
+    {
+      "filename": "html2canvas-pro-1.6.7.LICENSE",
+      "runtime_path": "/_catsco/runtime/html2canvas-pro-1.6.7.LICENSE",
+      "source": "webapp/public/catsco-runtime/html2canvas-pro-1.6.7.LICENSE",
+      "sha256": "04092b9193d5ef3c611d82509387a6341447dccbe2330716884383c4dc9c568a",
+      "bytes": 2201,
+      "mime_type": "text/plain"
     },
     {
       "filename": "html2canvas-1.4.1.min.js",
