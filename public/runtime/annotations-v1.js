@@ -33,6 +33,9 @@
   var TYPE_SCREENSHOT_REQUEST = 'catsco.gateway.annotation.screenshot.request.v1';
   var TYPE_SCREENSHOT_RESULT = 'catsco.gateway.annotation.screenshot.result.v1';
   var TYPE_SCREENSHOT_CANCEL = 'catsco.gateway.annotation.screenshot.cancel.v1';
+  var TYPE_COMPOSE = 'catsco.artifact.compose.v1';
+  var TYPE_COMPOSE_ACK = 'catsco.artifact.compose.ack.v1';
+  var COMPOSE_CONTRACT = BRIDGE_CONTRACT;  // envelope must satisfy the host's session check
 
   var CAPABILITIES = ['element', 'text', 'region'];
   var MAX_ID_CHARS = 128;
@@ -707,6 +710,7 @@
       return null;
     }
     var customGetElementId = typeof config.getElementId === 'function' ? config.getElementId : null;
+    var composeAckHandler = typeof config.onComposeAck === 'function' ? config.onComposeAck : null;
     var revision = config.revision;
 
     var state = {
@@ -725,6 +729,7 @@
       screenshotJob: null,
       rendering: false,
       documentEpoch: 0,
+      composeRequests: new Map(),
     };
 
     function post(message) {
@@ -773,6 +778,55 @@
         page: page,
         selection: selection,
       });
+    }
+
+    function normalizeCompose(value) {
+      // Accept a bare string for convenience, or { text }. Nothing else is
+      // interpreted: the text is handed over verbatim.
+      if (typeof value === 'string') {
+        return value.trim() ? { text: value } : null;
+      }
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+      if (typeof value.text !== 'string') return null;
+      return value.text.trim() ? { text: value.text } : null;
+    }
+
+    // Ask the host to inject this text into the owning bot's conversation.
+    // Returns false only when the request could not be handed over at all
+    // (no session, or a bad payload); the outcome arrives via the ack.
+    function proposeCompose(value) {
+      if (state.disposed || !state.session) return false;
+      var normalized = normalizeCompose(value);
+      if (!normalized) return false;
+      var requestId = 'cc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      state.composeRequests.set(requestId, Date.now());
+      if (state.composeRequests.size > 64) {
+        state.composeRequests.delete(state.composeRequests.keys().next().value);
+      }
+      return post({
+        type: TYPE_COMPOSE,
+        contract_version: COMPOSE_CONTRACT,
+        session_id: state.session,
+        request_id: requestId,
+        text: normalized.text,
+      });
+    }
+
+    function handleComposeAck(payload) {
+      var requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
+      if (!requestId || !state.composeRequests.has(requestId)) return;
+      state.composeRequests.delete(requestId);
+      if (typeof composeAckHandler === 'function') {
+        try {
+          // No conversation id is surfaced: the application has no platform API
+          // access from a cross-origin frame, so success/failure is the whole
+          // contract it can act on.
+          composeAckHandler({
+            accepted: payload.accepted === true,
+            reason: payload.reason || '',
+          });
+        } catch (error) { /* consumer fault must not break the dispatcher */ }
+      }
     }
 
     function sendPageChanged() {
@@ -1214,6 +1268,12 @@
     }
 
     function onMessage(event) {
+        if (event.data && event.data.type === TYPE_COMPOSE_ACK) {
+          if (event.origin === parentOrigin && event.data.contract_version === BRIDGE_CONTRACT) {
+            handleComposeAck(event.data);
+          }
+          return;
+        }
       if (state.disposed) return;
       if (event.origin !== parentOrigin) return;
       if (event.source !== window.parent) return;
@@ -1305,6 +1365,7 @@
         }
       },
       mode() { return state.mode; },
+      proposeCompose: proposeCompose,
       dispose() {
         if (state.disposed) return;
         invalidateScreenshot();
@@ -1375,6 +1436,8 @@
       screenshotRequest: TYPE_SCREENSHOT_REQUEST,
       screenshotResult: TYPE_SCREENSHOT_RESULT,
       screenshotCancel: TYPE_SCREENSHOT_CANCEL,
+      compose: TYPE_COMPOSE,
+      composeAck: TYPE_COMPOSE_ACK,
     },
   };
   bootstrapAttribute(originsAttribute);
