@@ -3,15 +3,15 @@
   "runtime_path": "/_catsco/runtime/annotations-v1.js",
   "config_attribute": "data-catsco-parent-origins",
   "source": "webapp/public/catsco-annotations.js",
-  "sha256": "3783f3ec184fbb7dd8d595374d9c6315d3eba43223dd9f77523afb140fd041b2",
-  "bytes": 62533,
+  "sha256": "27bd03a1d94abcda0c9fe779b726c4937a32ee696b7ee5a7a6ea028262fa0a12",
+  "bytes": 64144,
   "resources": [
     {
       "filename": "annotations-v1.js",
       "runtime_path": "/_catsco/runtime/annotations-v1.js",
       "source": "webapp/public/catsco-annotations.js",
-      "sha256": "3783f3ec184fbb7dd8d595374d9c6315d3eba43223dd9f77523afb140fd041b2",
-      "bytes": 62533,
+      "sha256": "27bd03a1d94abcda0c9fe779b726c4937a32ee696b7ee5a7a6ea028262fa0a12",
+      "bytes": 64144,
       "mime_type": "application/javascript"
     },
     {
