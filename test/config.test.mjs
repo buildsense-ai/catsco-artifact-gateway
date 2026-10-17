@@ -90,47 +90,85 @@ test('the tunnel admits as many connections per client as an application route',
 
 test('bulk application traffic cannot starve the endpoints that open an application', () => {
   // Every application route and every control-plane route used to share one
-  // per-client request zone. An application loading its own assets therefore
-  // spent the budget the browser needed for the launch that followed it, and the
-  // launch came back 503 — the application could not be opened at all. Measured
-  // against production before the split: a page load of ~44 concurrent asset
-  // requests, then the launch refused.
+  // per-client budget. An application loading its own assets therefore spent the
+  // allowance the browser needed for the launch that followed it, and the launch
+  // came back 503 — the application could not be opened at all. Measured against
+  // production before the split: one page load issued ~44 concurrent asset
+  // requests, and the launch immediately after was refused.
   //
-  // Keep the two budgets separate, and keep the control-plane rate at or above
-  // the one the identity endpoints need to stay usable.
-  // controlPort is what makes the control-plane locations render at all.
+  // The same applies to connections: limit_conn_zone is one counter per client
+  // shared by every location, so a bulk route admitting more connections than a
+  // control-plane route lets a client spend the allowance its own identity
+  // request needs. Both budgets must therefore be split, not just the request one.
   const r = renderGateway({ ...g, controlPort: 22445 });
-  const zones = r.nginx.split('\n').filter((line) => line.includes('limit_req_zone'));
-  const rateOf = (name) => zones.find((line) => line.includes(`zone=${name}:`))?.match(/rate=(\d+)r\/s/)?.[1];
 
-  const bulk = rateOf('cag_p0_requests');
-  const control = rateOf('cag_p0_control');
-  assert.ok(bulk, 'the bulk zone must be defined');
-  assert.ok(control, 'the control zone must be defined');
-  assert.notEqual(bulk, control, 'the two budgets must be separate entries, not one shared value');
+  const definedZones = (directive) => r.nginx.split('\n')
+    .filter((line) => line.startsWith(directive))
+    .map((line) => line.match(/zone=(\w+):/)?.[1])
+    .filter(Boolean);
+  const requestZones = definedZones('limit_req_zone');
+  const connectionZones = definedZones('limit_conn_zone');
+  assert.ok(requestZones.includes('cag_p0_requests'), 'the bulk request zone must be defined');
+  assert.ok(requestZones.includes('cag_p0_control'), 'the control request zone must be defined');
+  assert.ok(connectionZones.includes('cag_p0_connections'), 'the bulk connection zone must be defined');
+  assert.ok(connectionZones.includes('cag_p0_control_connections'), 'the control connection zone must be defined');
 
-  const lines = r.locations.split('\n');
+  // Blocks are matched on the rendered text, so a single-line control-plane
+  // location and a multi-line application route are read the same way.
   const blockOf = (header) => {
-    const start = lines.findIndex((line) => line.includes(header));
-    assert.ok(start >= 0, `${header} must be rendered`);
-    const end = lines.indexOf('}', start);
-    assert.ok(end > start, `${header} must be a closed block`);
-    return lines.slice(start, end + 1).join('\n');
+    const pattern = new RegExp(`${header.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([\\s\\S]*?)\\}`);
+    const match = r.locations.match(pattern);
+    assert.ok(match, `${header} must be rendered as a closed block`);
+    return match[0];
   };
-  const zoneOf = (block) => block.match(/limit_req zone=(\w+) burst=(\d+)/);
+  const requestZoneOf = (block) => block.match(/limit_req zone=(\w+) burst=(\d+)/);
+  const connectionZoneOf = (block) => block.match(/limit_conn (\w+) (\d+)/);
 
-  // The identity and launch endpoints a browser must reach to open anything.
-  for (const header of ['location ^~ /_launch/', 'location ^~ /_auth/', 'location = /_gateway/me', 'location = /_gateway/codes']) {
-    assert.equal(zoneOf(blockOf(header))?.[1], 'cag_p0_control', `${header} must use the control budget`);
+  // Every endpoint a browser must reach to open an application, and to stay
+  // identified once it has: none of them may sit on the bulk budget.
+  const controlLocations = [
+    'location = /api/apps',
+    'location = /_gateway/health',
+    'location = /_gateway/me',
+    'location = /_gateway/codes',
+    'location ^~ /_gateway/apps',
+    'location ^~ /_auth/',
+    'location ^~ /_launch/',
+  ];
+  for (const header of controlLocations) {
+    const block = blockOf(header);
+    assert.equal(requestZoneOf(block)?.[1], 'cag_p0_control', `${header} must use the control request budget`);
+    const connection = connectionZoneOf(block);
+    if (connection) {
+      assert.equal(connection[1], 'cag_p0_control_connections', `${header} must use the control connection budget`);
+    }
   }
-  // Bulk traffic: application content and the tunnel transports.
-  assert.equal(zoneOf(blockOf('location ^~ /demo/'))?.[1], 'cag_p0_requests', 'application content must use the bulk budget');
-  assert.equal(zoneOf(blockOf('location = /_gateway/tunnel'))?.[1], 'cag_p0_control', 'the tunnel handshake must use the control budget');
 
-  // The bulk burst has to hold a real page load, not a token one: a measured
-  // application issued 44 concurrent asset requests before the launch.
-  assert.ok(Number(zoneOf(blockOf('location ^~ /demo/'))?.[2]) >= 44, 'the bulk burst must hold a real page load');
+  // Bulk traffic keeps its own budget.
+  const application = blockOf('location ^~ /demo/');
+  assert.equal(requestZoneOf(application)?.[1], 'cag_p0_requests', 'application content must use the bulk request budget');
+  assert.equal(connectionZoneOf(application)?.[1], 'cag_p0_connections', 'application content must use the bulk connection budget');
+
+  // The tunnel carries an application's own transport, and its client is the bot
+  // that published it — one bot publishing N applications opens N connections
+  // from one address. It belongs to the bulk budget, not the control one.
+  const tunnel = blockOf('location = /_gateway/tunnel');
+  assert.equal(connectionZoneOf(tunnel)?.[1], 'cag_p0_connections', 'the tunnel must use the bulk connection budget');
+
+  // A control-plane ceiling below the bulk one reintroduces the same starvation
+  // in the connection dimension, so the control ceiling must not be the smaller.
+  const applicationConnections = Number(connectionZoneOf(application)?.[2]);
+  for (const header of controlLocations) {
+    const connection = connectionZoneOf(blockOf(header));
+    if (!connection) continue;
+    assert.ok(Number(connection[2]) >= applicationConnections,
+      `${header} must not admit fewer connections than a bulk route`);
+  }
+
+  // The bulk burst has to hold a real page load, not a token one.
+  assert.ok(Number(requestZoneOf(application)?.[2]) >= 44, 'the bulk burst must hold a real page load');
 });
+
 test('reject duplicate routes and configuration injection', () => {
   assert.throws(() => renderGateway({ ...g, apps: [g.apps[0], g.apps[0]] }));
   assert.throws(() => renderGateway({ ...g, hostKey: '/etc/cert;evil' }));
