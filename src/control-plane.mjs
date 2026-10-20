@@ -455,8 +455,23 @@ export function buildAppList(config, { updatedAt = null, agent = null, statuses 
       // could not or did not probe. A list that cannot be probed still lists:
       // saying nothing is better than claiming an application is reachable.
       status: statuses?.get(app.id) ?? 'unknown',
-      updated_at: updatedAt,
+      updated_at: entryTimestamp(app, updatedAt),
     }));
+}
+
+// The time to report for one application. An entry that carries its own stamp
+// answers with it; everything else falls back to the config file's timestamp,
+// which is all that existed before entries were stamped and is still the honest
+// answer for an application registered by hand.
+//
+// The fallback is also why this is not `app.updatedAt ?? updatedAt`: the file is
+// read directly, so a hand edit can put anything here, and a value that does not
+// parse would render as an invalid date in the sidebar instead of the one fact
+// the gateway does know.
+function entryTimestamp(app, fallback) {
+  const own = app?.updatedAt;
+  if (typeof own === 'string' && own.trim() && !Number.isNaN(Date.parse(own))) return own;
+  return fallback;
 }
 
 function agentRef(value) {
@@ -623,7 +638,7 @@ export function createControlPlane({
       url: urls[0],
       urls,
       ...local,
-      updated_at: current.updatedAt,
+      updated_at: entryTimestamp(app, current.updatedAt),
     };
   }
 
@@ -696,6 +711,12 @@ export function createControlPlane({
       // Annotation opt-in is operator-owned gateway configuration. Publishing
       // or updating an app must neither enable it nor erase an existing flag.
       annotations: previous?.annotations,
+      // This entry's own last-changed time. Without it every application in the
+      // list inherits the config file's timestamp, so one publish appears to
+      // have updated all of them at once and the sidebar's recency sort stops
+      // meaning anything. Stamped here rather than in the reply so the value
+      // survives the next read from disk.
+      updatedAt: new Date().toISOString(),
     };
     // Same rule as the title: an update that does not send a local port keeps
     // the recorded one, so rotating a key cannot erase what the connector was
