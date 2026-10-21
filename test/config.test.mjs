@@ -42,10 +42,16 @@ test('each application declares its own request body ceiling, bounded by the gat
 });
 test('the rendered CSP lets an application serve its own page', () => {
   const line = renderGateway(g).locations.split('\n').find(l => l.includes('Content-Security-Policy'));
-  // Loading one's own script file, showing an image and running a worker is the
-  // ordinary case for a published application; a policy missing these directives
-  // blocks all three, which is how a working page turns into a blank one.
-  for (const directive of ["script-src 'self'", "style-src 'self'", "img-src 'self' data: blob:", "font-src 'self' data:", "worker-src 'self' blob:", 'object-src']) assert.ok(line.includes(directive), directive);
+  // Loading one's own script file, showing an image, playing a video and running a
+  // worker is the ordinary case for a published application; a policy missing these
+  // directives blocks all four, which is how a working page turns into a blank one.
+  //
+  // `media-src` is listed separately from the rest because it is the one that was
+  // missing: media has no directive of its own to fall back on other than
+  // `default-src`, so `default-src 'none'` silently blocked every <video>/<audio>
+  // while scripts, images and fonts kept working — a page that looked fine until
+  // something tried to play.
+  for (const directive of ["script-src 'self'", "style-src 'self'", "media-src 'self' blob:", "img-src 'self' data: blob:", "font-src 'self' data:", "worker-src 'self' blob:", 'object-src']) assert.ok(line.includes(directive), directive);
   // ...while the directives that keep a hosted page from escaping its own origin
   // stay in place.
   for (const directive of ["default-src 'none'", "base-uri 'none'", "form-action 'none'"]) assert.ok(line.includes(directive), directive);
