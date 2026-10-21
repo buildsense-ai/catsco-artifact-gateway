@@ -1310,6 +1310,33 @@ test('a new application is visible to every route at once', async () => {
   }, config);
 });
 
+test('the production inventory reports each application\'s own time', async () => {
+  // The sidebar reads this route (`/_gateway/apps` -> registeredApp), not
+  // `/api/apps`, so the per-entry stamp has to be asserted here too. Reverting
+  // registeredApp to the config file's timestamp would leave every sidebar entry
+  // comparing equal and the recency sort meaningless, while the `/api/apps` test
+  // above would still pass — that is the gap this covers.
+  const stamped = {
+    id: 'stamped',
+    remotePort: 28193,
+    publicKey: 'ssh-ed25519 AAAASTAMPED stamped',
+    title: '带时间戳',
+    // A fixed past date, so the assertion cannot depend on how fast the test ran.
+    updatedAt: '2026-09-17T00:00:00.000Z',
+  };
+  const config = registrationConfig([stamped]);
+  await withServer(async ({ base }) => {
+    const listed = await apps(base);
+    assert.equal(listed.status, 200);
+    const byId = new Map(listed.body.apps.map(app => [app.id, app]));
+    assert.equal(byId.get('stamped').updated_at, '2026-09-17T00:00:00.000Z', 'an entry that carries its own time answers with it');
+    // `demo` predates entries being stamped, so it keeps answering with the config
+    // file's time — the one fact the gateway does know for it.
+    assert.equal(new Date(byId.get('demo').updated_at).toISOString(), byId.get('demo').updated_at);
+    assert.notEqual(byId.get('demo').updated_at, '2026-09-17T00:00:00.000Z', 'an unstamped entry does not borrow a stamped one\'s time');
+  }, config);
+});
+
 test('two registrations in flight both persist', async () => {
   const config = registrationConfig();
   await withServer(async ({ base }) => {
