@@ -1112,7 +1112,11 @@ test('a registration is assigned a port and answers with every public URL', asyn
 
     const onDisk = config.read();
     assert.deepEqual(onDisk.apps.map(app => app.id), ['demo', 'other', 'board', 'second']);
-    assert.deepEqual(onDisk.apps[2], { id: 'board', title: '我的看板', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board', localPort: 20000 });
+    // The entry carries its own timestamp, so it is asserted separately from the
+    // fields a registration is allowed to choose.
+    const { updatedAt, ...storedBoard } = onDisk.apps[2];
+    assert.deepEqual(storedBoard, { id: 'board', title: '我的看板', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board', localPort: 20000 });
+    assert.equal(new Date(updatedAt).toISOString(), updatedAt, 'the stored entry stamps its own time');
     assert.equal(fs.statSync(config.configPath).mode & 0o777, 0o600, 'the config keeps its mode');
   }, config);
 });
@@ -1174,8 +1178,35 @@ test('re-registering an application keeps its remote port and its title', async 
 
     const stored = config.read().apps.filter(app => app.id === 'board');
     assert.equal(stored.length, 1, 'an update replaces the entry instead of adding one');
-    assert.deepEqual(stored[0], { id: 'board', title: '我的看板', agent: '365', remotePort: first.body.remote_port, publicKey: 'ssh-ed25519 AAAALATER board', localPort: 20011 });
+    const { updatedAt: restamped, ...restoredBoard } = stored[0];
+    assert.deepEqual(restoredBoard, { id: 'board', title: '我的看板', agent: '365', remotePort: first.body.remote_port, publicKey: 'ssh-ed25519 AAAALATER board', localPort: 20011 });
+    assert.equal(new Date(restamped).toISOString(), restamped, 'an update restamps the entry');
   }, config);
+});
+
+test('the list reports each application\'s own time, not the config file\'s', () => {
+  // One config file holds every application, so its mtime changes whenever any
+  // one of them is published. Reporting that as every entry's time made a single
+  // publish look like it had touched all of them, and left the sidebar's recency
+  // sort comparing equal values.
+  const stamped = { ...CONFIG, apps: [
+    { id: 'demo', remotePort: 28191, publicKey: 'ssh-ed25519 AAAATEST demo', title: '演示应用', updatedAt: '2026-09-17T00:00:00.000Z' },
+    { id: 'other', remotePort: 28192, publicKey: 'ssh-ed25519 AAAATEST2 other' },
+  ] };
+  const apps = buildAppList(stamped, { updatedAt: '2026-10-20T00:00:00.000Z' });
+  assert.equal(apps[0].updated_at, '2026-09-17T00:00:00.000Z', 'an entry that carries its own time answers with it');
+  assert.equal(apps[1].updated_at, '2026-10-20T00:00:00.000Z', 'an entry without one falls back to the config time');
+
+  // The file is read directly, so a hand edit can put anything in the field; a
+  // value that does not parse must fall back rather than render as an invalid
+  // date in the sidebar.
+  const broken = { ...CONFIG, apps: [
+    { id: 'demo', remotePort: 28191, publicKey: 'ssh-ed25519 AAAATEST demo', updatedAt: 'not a date' },
+    { id: 'other', remotePort: 28192, publicKey: 'ssh-ed25519 AAAATEST2 other', updatedAt: '   ' },
+  ] };
+  for (const app of buildAppList(broken, { updatedAt: '2026-10-20T00:00:00.000Z' })) {
+    assert.equal(app.updated_at, '2026-10-20T00:00:00.000Z', 'an unusable stamp falls back instead of leaking through');
+  }
 });
 
 test('registration cannot enable runtime and preserves operator-owned annotation opt-in', async () => {
@@ -1276,6 +1307,33 @@ test('a new application is visible to every route at once', async () => {
     const { body } = await issue(base, { app: 'board', uid: 'u1' });
     assert.equal((await fetch(`${body.launch_url.replace('https://artifact.example.cc', base)}`, { redirect: 'manual' })).status, 302);
     assert.equal((await fetch(`${base}/_auth/declined?app=board`)).status, 200);
+  }, config);
+});
+
+test('the production inventory reports each application\'s own time', async () => {
+  // The sidebar reads this route (`/_gateway/apps` -> registeredApp), not
+  // `/api/apps`, so the per-entry stamp has to be asserted here too. Reverting
+  // registeredApp to the config file's timestamp would leave every sidebar entry
+  // comparing equal and the recency sort meaningless, while the `/api/apps` test
+  // above would still pass — that is the gap this covers.
+  const stamped = {
+    id: 'stamped',
+    remotePort: 28193,
+    publicKey: 'ssh-ed25519 AAAASTAMPED stamped',
+    title: '带时间戳',
+    // A fixed past date, so the assertion cannot depend on how fast the test ran.
+    updatedAt: '2026-09-17T00:00:00.000Z',
+  };
+  const config = registrationConfig([stamped]);
+  await withServer(async ({ base }) => {
+    const listed = await apps(base);
+    assert.equal(listed.status, 200);
+    const byId = new Map(listed.body.apps.map(app => [app.id, app]));
+    assert.equal(byId.get('stamped').updated_at, '2026-09-17T00:00:00.000Z', 'an entry that carries its own time answers with it');
+    // `demo` predates entries being stamped, so it keeps answering with the config
+    // file's time — the one fact the gateway does know for it.
+    assert.equal(new Date(byId.get('demo').updated_at).toISOString(), byId.get('demo').updated_at);
+    assert.notEqual(byId.get('demo').updated_at, '2026-09-17T00:00:00.000Z', 'an unstamped entry does not borrow a stamped one\'s time');
   }, config);
 });
 
