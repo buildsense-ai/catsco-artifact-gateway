@@ -51,7 +51,20 @@ test('the rendered CSP lets an application serve its own page', () => {
   // `default-src`, so `default-src 'none'` silently blocked every <video>/<audio>
   // while scripts, images and fonts kept working — a page that looked fine until
   // something tried to play.
-  for (const directive of ["script-src 'self'", "style-src 'self'", "media-src 'self' blob:", "img-src 'self' data: blob:", "font-src 'self' data:", "worker-src 'self' blob:", 'object-src']) assert.ok(line.includes(directive), directive);
+  //
+  // `frame-src` is the same failure one level up: frames fall back to `default-src`
+  // too, so `default-src 'none'` silently blocked every <iframe>, including an
+  // application showing a PDF it produced itself (an Office document converted to
+  // PDF, a generated report). Allowing the frame is all the platform owes here;
+  // producing the PDF stays the application's business.
+  //
+  // It is scoped to the application's own path rather than `'self'`. Every
+  // application shares one origin (`/<id>/` is a path, not a host), so `'self'`
+  // would also let one application frame — and, being same-origin, read — another
+  // application's pages, including `/_gateway/me`. The path form matches the
+  // application's own frames while keeping that boundary, exactly like
+  // `connect-src` above.
+  for (const directive of ["script-src 'self'", "style-src 'self'", "media-src 'self' blob:", "frame-src https://artifact.example.cc/demo/ https://artifact.example.cn/demo/ blob:", "img-src 'self' data: blob:", "font-src 'self' data:", "worker-src 'self' blob:", 'object-src']) assert.ok(line.includes(directive), directive);
   // ...while the directives that keep a hosted page from escaping its own origin
   // stay in place.
   for (const directive of ["default-src 'none'", "base-uri 'none'", "form-action 'none'"]) assert.ok(line.includes(directive), directive);
