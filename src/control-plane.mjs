@@ -455,23 +455,26 @@ export function buildAppList(config, { updatedAt = null, agent = null, statuses 
       // could not or did not probe. A list that cannot be probed still lists:
       // saying nothing is better than claiming an application is reachable.
       status: statuses?.get(app.id) ?? 'unknown',
-      updated_at: entryTimestamp(app, updatedAt),
+      updated_at: entryTimestamp(app),
     }));
 }
 
-// The time to report for one application. An entry that carries its own stamp
-// answers with it; everything else falls back to the config file's timestamp,
-// which is all that existed before entries were stamped and is still the honest
-// answer for an application registered by hand.
+// The time to report for one application: its own stamp, or nothing.
 //
-// The fallback is also why this is not `app.updatedAt ?? updatedAt`: the file is
-// read directly, so a hand edit can put anything here, and a value that does not
-// parse would render as an invalid date in the sidebar instead of the one fact
-// the gateway does know.
-function entryTimestamp(app, fallback) {
+// One config file holds every application, so the file's mtime changes whenever
+// ANY application is republished. Reporting that as an entry's time made a
+// single publish look like it touched all of them — which is exactly the bug
+// this endpoint had. An entry registered before stamps existed has no time we
+// can honestly attribute to it, so it reports none and the sidebar omits the
+// line rather than showing a time that is not its own. The next publish stamps
+// it and it starts reporting a real time.
+//
+// `null` is deliberate rather than the file time: a wrong timestamp is worse
+// than a missing one, because the reader cannot tell it is wrong.
+function entryTimestamp(app) {
   const own = app?.updatedAt;
   if (typeof own === 'string' && own.trim() && !Number.isNaN(Date.parse(own))) return own;
-  return fallback;
+  return null;
 }
 
 function agentRef(value) {
@@ -638,7 +641,7 @@ export function createControlPlane({
       url: urls[0],
       urls,
       ...local,
-      updated_at: entryTimestamp(app, current.updatedAt),
+      updated_at: entryTimestamp(app),
     };
   }
 
