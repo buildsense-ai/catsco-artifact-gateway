@@ -122,8 +122,8 @@ test('public list exposes only id, title, url, status and time', () => {
   // rather than a claim that every application is reachable.
   const apps = buildAppList(CONFIG, { updatedAt: '2026-09-17T00:00:00.000Z' });
   assert.deepEqual(apps, [
-    { id: 'demo', title: '演示应用', url: 'https://artifact.example.cc/demo/', status: 'unknown', updated_at: '2026-09-17T00:00:00.000Z' },
-    { id: 'other', title: 'other', url: 'https://artifact.example.cc/other/', status: 'unknown', updated_at: '2026-09-17T00:00:00.000Z' },
+    { id: 'demo', title: '演示应用', url: 'https://artifact.example.cc/demo/', status: 'unknown', updated_at: null },
+    { id: 'other', title: 'other', url: 'https://artifact.example.cc/other/', status: 'unknown', updated_at: null },
   ]);
   // A probe result is reported per application, and an application the probe did
   // not cover stays 'unknown' instead of inheriting a neighbour's answer.
@@ -1187,15 +1187,16 @@ test('re-registering an application keeps its remote port and its title', async 
 test('the list reports each application\'s own time, not the config file\'s', () => {
   // One config file holds every application, so its mtime changes whenever any
   // one of them is published. Reporting that as every entry's time made a single
-  // publish look like it had touched all of them, and left the sidebar's recency
-  // sort comparing equal values.
+  // publish look like it had touched all of them — the sidebar showed every
+  // application as just-updated. An entry that predates stamping has no time of
+  // its own, so it reports none and the sidebar omits the line.
   const stamped = { ...CONFIG, apps: [
     { id: 'demo', remotePort: 28191, publicKey: 'ssh-ed25519 AAAATEST demo', title: '演示应用', updatedAt: '2026-09-17T00:00:00.000Z' },
     { id: 'other', remotePort: 28192, publicKey: 'ssh-ed25519 AAAATEST2 other' },
   ] };
   const apps = buildAppList(stamped, { updatedAt: '2026-10-20T00:00:00.000Z' });
   assert.equal(apps[0].updated_at, '2026-09-17T00:00:00.000Z', 'an entry that carries its own time answers with it');
-  assert.equal(apps[1].updated_at, '2026-10-20T00:00:00.000Z', 'an entry without one falls back to the config time');
+  assert.equal(apps[1].updated_at, null, 'an entry without one reports no time instead of inheriting the file time');
 
   // The file is read directly, so a hand edit can put anything in the field; a
   // value that does not parse must fall back rather than render as an invalid
@@ -1205,7 +1206,7 @@ test('the list reports each application\'s own time, not the config file\'s', ()
     { id: 'other', remotePort: 28192, publicKey: 'ssh-ed25519 AAAATEST2 other', updatedAt: '   ' },
   ] };
   for (const app of buildAppList(broken, { updatedAt: '2026-10-20T00:00:00.000Z' })) {
-    assert.equal(app.updated_at, '2026-10-20T00:00:00.000Z', 'an unusable stamp falls back instead of leaking through');
+    assert.equal(app.updated_at, null, 'an unusable stamp reports nothing instead of leaking or borrowing the file time');
   }
 });
 
@@ -1330,10 +1331,10 @@ test('the production inventory reports each application\'s own time', async () =
     assert.equal(listed.status, 200);
     const byId = new Map(listed.body.apps.map(app => [app.id, app]));
     assert.equal(byId.get('stamped').updated_at, '2026-09-17T00:00:00.000Z', 'an entry that carries its own time answers with it');
-    // `demo` predates entries being stamped, so it keeps answering with the config
-    // file's time — the one fact the gateway does know for it.
-    assert.equal(new Date(byId.get('demo').updated_at).toISOString(), byId.get('demo').updated_at);
-    assert.notEqual(byId.get('demo').updated_at, '2026-09-17T00:00:00.000Z', 'an unstamped entry does not borrow a stamped one\'s time');
+    // `demo` predates entries being stamped, so it has no time of its own. It must
+    // report none: the config file's mtime changes on every publish by anyone, so
+    // borrowing it is what made one publish look like it touched every entry.
+    assert.equal(byId.get('demo').updated_at, null, 'an unstamped entry reports no time rather than the shared file time');
   }, config);
 });
 
