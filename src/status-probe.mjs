@@ -166,38 +166,41 @@ export function createStatusProbe({
   // outbound connections from this process, and per-request limits multiply by the
   // number of concurrent requests. Identity gets its own gate for the same reason
   // it gets its own budget.
-  let active = 0;
-  const waiting = [];
-  let identityActive = 0;
-  const identityWaiting = [];
 
-  function gate() {
-    let held = false;
+  // A counting gate, owned per purpose.
+  //
+  // The count is the only state on purpose. An earlier version also kept a
+  // `held` flag per gate and consulted it in `release`; because one gate serves
+  // many concurrent holders, the first release cleared the flag and every other
+  // holder's release then returned early without decrementing. The count only
+  // ever went up, so after the first batch the probe ran one application at a
+  // time — the same whole-list timeout the split into two passes was meant to
+  // avoid, arrived at by a different route, and permanently.
+  function createGate(limit) {
+    let active = 0;
+    const waiter = [];
     return {
-      async acquire(limit, count, queue) {
-        if (count.active < limit) { count.active += 1; held = true; return; }
-        await new Promise(resolve => queue.push(resolve));
-        held = true;
+      async acquire() {
+        if (active < limit) { active += 1; return; }
+        // The releaser hands over its slot by incrementing before waking us, so
+        // the resumed caller already holds one and must not take another.
+        await new Promise(resolve => waiter.push(resolve));
       },
-      release(limit, count, queue) {
-        if (!held) return;
-        held = false;
-        count.active -= 1;
-        const next = queue.shift();
-        if (next) { count.active += 1; next(); }
+      release() {
+        active -= 1;
+        const next = waiter.shift();
+        if (next) { active += 1; next(); }
       },
     };
   }
 
-  const reachGate = gate();
-  const identityGate = gate();
-  const reachCounter = { active: 0 };
-  const identityCounter = { active: 0 };
+  const reachGate = createGate(concurrency);
+  const identityGate = createGate(identityConcurrency);
 
-  async function acquire() { await reachGate.acquire(concurrency, reachCounter, waiting); }
-  function release() { reachGate.release(concurrency, reachCounter, waiting); }
-  async function acquireIdentity() { await identityGate.acquire(identityConcurrency, identityCounter, identityWaiting); }
-  function releaseIdentity() { identityGate.release(identityConcurrency, identityCounter, identityWaiting); }
+  async function acquire() { await reachGate.acquire(); }
+  function release() { reachGate.release(); }
+  async function acquireIdentity() { await identityGate.acquire(); }
+  function releaseIdentity() { identityGate.release(); }
 
   function targetsOf(apps) {
     const seen = new Set();

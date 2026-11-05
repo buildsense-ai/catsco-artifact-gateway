@@ -1605,6 +1605,40 @@ test('a slow identity document cannot turn the fleet into unknowns', async () =>
   assert.ok(identityCalls > 0, 'identity was still consulted');
 });
 
+test('the concurrency gate keeps its full width across refreshes', async () => {
+  // Regression: an earlier version kept a `held` flag per gate and consulted it
+  // in release. One gate serves many holders, so the first release cleared the
+  // flag and every other holder's release returned early without decrementing
+  // the count. The count only rose, and from the second refresh onward the probe
+  // ran one application at a time — the same whole-list timeout the two passes
+  // were meant to avoid, arrived at by a different route and never recovered.
+  const apps = Array.from({ length: 40 }, (_, i) => ({ id: `app-${i}`, remotePort: 30000 + i }));
+  let live = 0;
+  let peak = 0;
+  const probe = createStatusProbe({
+    cacheMs: 0,
+    probe: async () => {
+      live += 1;
+      peak = Math.max(peak, live);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      live -= 1;
+      return 'online';
+    },
+    identity: async () => ({ state: 'absent' }),
+  });
+
+  const peaks = [];
+  for (let round = 1; round <= 3; round += 1) {
+    peak = 0;
+    await probe.probeAll(apps);
+    peaks.push(peak);
+  }
+  // Width is what the deadline depends on: 40 applications at 5ms each fit in a
+  // single budget only while the gate runs wide. A leaking count shows up as a
+  // collapsing peak on the second round, not on the first.
+  assert.deepEqual(peaks, [8, 8, 8], `gate width collapsed: ${JSON.stringify(peaks)}`);
+});
+
 test('an identity read that throws cannot make a reachable application offline', async () => {
   // The reachability answer is the product; identity only refines it. A failure in
   // the refinement must not downgrade a working application.
