@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { renderGateway } from '../src/gateway-config.mjs';
-import { remotePortAvailable, retireRemotePort } from '../src/remote-ports.mjs';
+import { inspectLease, LEASE, remotePortAvailable, retireRemotePort } from '../src/remote-ports.mjs';
 
 // Registration is the one step that needs the gateway host, so this script is
 // for whoever operates the gateway (a bot can also run it against a copy and
@@ -81,6 +81,23 @@ const others = (config.apps || []).filter(app => app.id !== entry.id);
 if (others.some(app => app.remotePort === entry.remotePort)) throw new Error(`Port ${entry.remotePort} is already registered`);
 const entryKey = entry.publicKey.split(' ')[1];
 if (others.some(app => app.publicKey.split(' ')[1] === entryKey)) throw new Error('This key is already registered to another application');
+
+// An operator editing the file by hand goes through the same lease authority as
+// the API, so a mapping that answers as another application cannot survive here
+// either.
+//
+// Unlike the API, this script is told the port explicitly and cannot quietly
+// pick a different one: the operator typed the number. So the outcome is a
+// refusal that names what the port actually serves, not a silent move.
+if (previous && previous.remotePort === entry.remotePort) {
+  const lease = await inspectLease(entry.remotePort, { appId: entry.id });
+  if (lease === LEASE.FOREIGN) {
+    throw new Error(
+      `Port ${entry.remotePort} currently answers as another application; refusing to keep it. `
+      + 'Choose a different remotePort in the registration file.',
+    );
+  }
+}
 
 const replaced = Boolean(previous);
 const next = { ...config, apps: [...others, entry] };
