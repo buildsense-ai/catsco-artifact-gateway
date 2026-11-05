@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { renderGateway } from '../src/gateway-config.mjs';
+import { remotePortAvailable, retireRemotePort } from '../src/remote-ports.mjs';
 
 // Registration is the one step that needs the gateway host, so this script is
 // for whoever operates the gateway (a bot can also run it against a copy and
@@ -16,10 +17,12 @@ if (!file) {
   ].join('\n'));
 }
 
-const config = JSON.parse(fs.readFileSync(file, 'utf8'));
+const original = fs.readFileSync(file, 'utf8');
+const config = JSON.parse(original);
 
 function write(next) {
   renderGateway(next);
+  if (fs.readFileSync(file, 'utf8') !== original) throw new Error('Gateway config changed; retry registration');
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, file);
@@ -41,8 +44,9 @@ if (second === '--list') {
 
 if (second === '--remove') {
   if (!third) throw new Error('--remove needs an application id');
-  const next = { ...config, apps: (config.apps || []).filter(app => app.id !== third) };
-  if (next.apps.length === (config.apps || []).length) throw new Error(`Unknown application: ${third}`);
+  const removed = (config.apps || []).find(app => app.id === third);
+  if (!removed) throw new Error(`Unknown application: ${third}`);
+  const next = { ...retireRemotePort(config, removed.remotePort), apps: config.apps.filter(app => app.id !== third) };
   write(next);
   console.log(JSON.stringify({ status: 'removed', id: third }, null, 2));
   process.exit(0);
@@ -78,6 +82,13 @@ if (others.some(app => app.remotePort === entry.remotePort)) throw new Error(`Po
 const entryKey = entry.publicKey.split(' ')[1];
 if (others.some(app => app.publicKey.split(' ')[1] === entryKey)) throw new Error('This key is already registered to another application');
 
-const replaced = (config.apps || []).some(app => app.id === entry.id);
-write({ ...config, apps: [...others, entry] });
+const replaced = Boolean(previous);
+const next = { ...config, apps: [...others, entry] };
+const candidate = previous && previous.remotePort !== entry.remotePort
+  ? retireRemotePort(next, previous.remotePort) : next;
+renderGateway(candidate);
+if ((!previous || previous.remotePort !== entry.remotePort) && !await remotePortAvailable(entry.remotePort)) {
+  throw new Error(`Port ${entry.remotePort} is already listening`);
+}
+write(candidate);
 console.log(JSON.stringify({ status: replaced ? 'updated' : 'registered', id: entry.id, agent: entry.agent, remotePort: entry.remotePort }, null, 2));

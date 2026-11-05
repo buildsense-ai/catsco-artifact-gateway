@@ -55,8 +55,9 @@ install_if_changed "$TMP/sshd" "$CONF/sshd" || sshd_changed=1
 
 # Validate before touching a running service. A failed check leaves the running
 # service on its old in-memory config, which is the whole rollback story here
-# (the .bak above is the manual one). Restarting sshd drops live tunnels;
-# connectors reconnect by themselves within a few seconds.
+# (the .bak above is the manual one). Authenticated SSH sessions can move into
+# separate PAM/systemd scopes and survive this restart. Port retirement and live
+# socket checks prevent those old sessions from serving a newly registered app.
 if [ "$nginx_changed" = 1 ]; then
   if nginx -t; then systemctl reload nginx; else echo "nginx -t failed; nginx not reloaded" >&2; failed=1; fi
 fi

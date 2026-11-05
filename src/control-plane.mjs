@@ -11,6 +11,7 @@ import { cookieName, httpsUrl, port } from './config.mjs';
 // deployment uses, so a registration that would break sshd or nginx fails here
 // instead of at the next apply.
 import { renderGateway } from './gateway-config.mjs';
+import { allocateRemotePort, remotePortAvailable, retireRemotePort } from './remote-ports.mjs';
 
 // Default platform handshake page. It must be the file the platform actually
 // serves: the single-page app owns every extension-less path, so a bare
@@ -502,17 +503,6 @@ function reservedPorts(view) {
   return [view.config.sshPort, WSS_PORT, view.config.controlPort].filter(value => Number.isInteger(value));
 }
 
-// First free port at or above the base. Skipping every registered port makes the
-// renderer's uniqueness rule hold by construction - the renderer still has the
-// last word, this only avoids asking it to reject a registration the gateway
-// itself could have predicted.
-function allocateRemotePort(apps, { base, ceiling, reserved }) {
-  const used = new Set(reserved);
-  for (const app of apps) used.add(app.remotePort);
-  for (let candidate = base; candidate <= ceiling; candidate++) if (!used.has(candidate)) return candidate;
-  return null;
-}
-
 export function createControlPlane({
   config,
   store,
@@ -524,6 +514,7 @@ export function createControlPlane({
   transportUrl = null,
   remotePortBase = REMOTE_PORT_BASE,
   remotePortCeiling = REMOTE_PORT_CEILING,
+  portAvailable = remotePortAvailable,
   logger = console,
   handshakeUrl = DEFAULT_HANDSHAKE_URL,
   handshakeUrls = null,
@@ -590,6 +581,17 @@ export function createControlPlane({
       logger.error(JSON.stringify({ event: 'config_reload_failed', message: error?.message }));
     }
     return view;
+  }
+
+  // Socket checks yield to the event loop. Serialize API writes so concurrent
+  // registrations cannot select the same port, and a delete cannot be undone by
+  // a registration persisting an older snapshot. Read request bodies before
+  // joining this queue so a slow publisher does not hold up other mutations.
+  let mutationQueue = Promise.resolve();
+  function mutateConfig(operation) {
+    const result = mutationQueue.then(operation);
+    mutationQueue = result.catch(() => {});
+    return result;
   }
 
   // Replace by rename, like scripts/register-app.mjs: nginx, sshd and the root
@@ -664,6 +666,10 @@ export function createControlPlane({
       return json(res, 400, { error: 'invalid_json' });
     }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'invalid_json' });
+    return mutateConfig(() => persistApplication(body, res));
+  }
+
+  async function persistApplication(body, res) {
     // Ownership decides whose sidebar the application appears in, so an
     // application that declares no owner is refused here rather than registered
     // into no one's list.
@@ -687,9 +693,21 @@ export function createControlPlane({
     }
     // An update keeps the port the running connector was told to forward:
     // moving it would break a tunnel that is already up.
-    const remotePort = previous
-      ? previous.remotePort
-      : allocateRemotePort(apps, { base: remotePortBase, ceiling: remotePortCeiling, reserved: reservedPorts(current) });
+    let remotePort = previous?.remotePort;
+    if (!previous) {
+      try {
+        remotePort = await allocateRemotePort(current.config, {
+          base: remotePortBase, ceiling: remotePortCeiling,
+          reserved: reservedPorts(current), available: portAvailable,
+        });
+      } catch {
+        logger.error(JSON.stringify({ event: 'port_allocation_failed' }));
+        return json(res, 503, { error: 'port_allocation_unavailable' });
+      }
+    }
+    // An operator's config writer is outside this process's queue. Re-read after
+    // the socket check so its changes are not overwritten by our old snapshot.
+    if (currentConfig() !== current) return persistApplication(body, res);
     if (!Number.isInteger(remotePort)) {
       return json(res, 409, { error: 'no_free_remote_port', message: `No free remote port between ${remotePortBase} and ${remotePortCeiling}` });
     }
@@ -759,7 +777,8 @@ export function createControlPlane({
     // removal is refused here instead of surfacing a renderer error for what is
     // a well formed request.
     if (!apps.length) return json(res, 409, { error: 'last_application' });
-    const next = { ...current.config, apps };
+    const removed = current.config.apps.find(app => app.id === id);
+    const next = { ...retireRemotePort(current.config, removed.remotePort), apps };
     try {
       renderGateway(next);
     } catch (error) {
@@ -863,10 +882,10 @@ export function createControlPlane({
           // percent-encoded one simply matches nothing.
           const id = path.slice('/_gateway/apps/'.length);
           if (req.method !== 'DELETE') return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'DELETE' });
-          return removeApplication(id, res);
+          return await mutateConfig(() => removeApplication(id, res));
         }
         if (req.method === 'GET') return json(res, 200, { apps: listApplications(current) });
-        if (req.method === 'POST') return registerApplication(req, res);
+        if (req.method === 'POST') return await registerApplication(req, res);
         return json(res, 405, { error: 'method_not_allowed' }, { Allow: 'GET, POST' });
       }
 
