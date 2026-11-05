@@ -9,6 +9,7 @@ import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/vie
 import { createControlPlane, createStatusProbe, probeApplication, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 import { remotePortAvailable } from '../src/remote-ports.mjs';
+import { APP_IDENTITY_CONTRACT, APP_IDENTITY_PATH } from '../src/app-identity.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
 const CONFIG = {
@@ -34,7 +35,7 @@ async function withServer(fn, options = {}) {
   // tests hand over a helper object that also carries `file` (the gateway config
   // they assert on), and a spread would make the viewer store write its state
   // into that very file.
-  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, portAvailable, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
+  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, portAvailable, readAppIdentity, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
   const store = new ViewerStore({ file: tmpState() });
   const server = createControlPlane({
     config: config || CONFIG,
@@ -47,6 +48,10 @@ async function withServer(fn, options = {}) {
     remotePortBase,
     remotePortCeiling,
     portAvailable: portAvailable || (async () => true),
+  // Same reason as portAvailable: the lease check must not depend on what is
+  // listening on the machine running the tests. The default reports "no claim",
+  // which is what an application predating the contract answers.
+  readAppIdentity: readAppIdentity || (async () => ({ state: 'unusable' })),
     handshakeUrl,
     handshakeUrls,
     platformIdentityUrl,
@@ -1510,3 +1515,134 @@ test('registration is unavailable without a config file to write', async () => {
 });
 
 
+// ---------------------------------------------------------------- identity
+//
+// What these cover: a port number says where traffic goes, never who answers.
+// Before this, a port serving somebody else's application answered 200, so
+// every reachability check called it healthy and the sidebar offered it as
+// normal. The identity document is the only thing that makes that visible.
+
+async function withApplication(handler, fn) {
+  const server = http.createServer(handler);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await fn(server.address().port, server);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+}
+
+function servesIdentity(appId, page = '<title>some page</title>') {
+  return (req, res) => {
+    if (req.url === APP_IDENTITY_PATH) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ contract: APP_IDENTITY_CONTRACT, app_id: appId }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(page);
+  };
+}
+
+test('a port that answers as a different application is a mismatch, not online', async () => {
+  await withApplication(servesIdentity('hr-portal'), async port => {
+    assert.equal(await probeApplication(port, { appId: 'report-pa-project' }), 'mismatch');
+    // The same port is correct for the application that actually owns it.
+    assert.equal(await probeApplication(port, { appId: 'hr-portal' }), 'online');
+    // With no id there is nothing to compare against: the probe keeps its old
+    // meaning, which is what every caller that does not know the id relies on.
+    assert.equal(await probeApplication(port), 'online');
+  });
+});
+
+test('a port that makes no claim stays "online", so existing applications are unaffected', async () => {
+  // Everything published before the contract answers exactly like this. If this
+  // test ever flips, deploying the check would relabel the whole fleet.
+  await withApplication((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<title>legacy application</title>');
+  }, async port => {
+    assert.equal(await probeApplication(port, { appId: 'report-pa-project' }), 'online');
+  });
+});
+
+test('an unreachable port is still offline, identity or not', async () => {
+  assert.equal(await probeApplication(1, { appId: 'demo', timeoutMs: 300 }), 'offline');
+});
+
+test('an update moves the application off a port that answers as somebody else', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    // The mapping was wrong, so it must not be kept: this is the only path that
+    // repairs an application that has been serving the wrong content since
+    // before ports were checked on the way out.
+    assert.notEqual(result.body.remote_port, original.remotePort);
+    assert.equal(result.body.title, 'New title');
+  }, {
+    ...config,
+    readAppIdentity: async port => (port === 28201
+      ? { state: 'claimed', appId: 'somebody-else' }
+      : { state: 'unusable' }),
+  });
+  // The port we walked away from must never be handed out again: an old session
+  // may still hold it, which is the same reason a deleted application's port is
+  // retired.
+  assert.deepEqual(config.read().retiredRemotePorts, [original.remotePort]);
+});
+
+test('an update keeps its port when nothing claims it', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+  }, { ...config, readAppIdentity: async () => ({ state: 'unusable' }) });
+  assert.equal(config.read().retiredRemotePorts, undefined, 'nothing to retire when the lease still stands');
+});
+
+test('an update keeps its port when the port claims this very application', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+  }, {
+    ...config,
+    readAppIdentity: async () => ({ state: 'claimed', appId: 'board' }),
+  });
+});
+
+test('an inspection that throws does not move a working application', async () => {
+  // A socket error while inspecting is not evidence that the port is wrong.
+  // Churning the port there would break a working tunnel for an unrelated
+  // failure, which is the opposite of what this check is for.
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+  }, {
+    ...config,
+    readAppIdentity: async () => { throw new Error('socket exploded'); },
+  });
+});
+
+test('a registration still never moves an existing application for no reason', async () => {
+  // The inverse guard: the lease check must not become a reason to reallocate on
+  // every publish. With no claim there is nothing to react to.
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    for (const title of ['A', 'B', 'C']) {
+      const result = await apps(base, { method: 'POST', body: registration({ title }) });
+      assert.equal(result.status, 201);
+      assert.equal(result.body.remote_port, original.remotePort, `publish ${title} kept the port`);
+    }
+  }, { ...config, readAppIdentity: async () => ({ state: 'absent' }) });
+});

@@ -11,7 +11,8 @@ import { cookieName, httpsUrl, port } from './config.mjs';
 // deployment uses, so a registration that would break sshd or nginx fails here
 // instead of at the next apply.
 import { renderGateway } from './gateway-config.mjs';
-import { allocateRemotePort, remotePortAvailable, retireRemotePort } from './remote-ports.mjs';
+import { allocateRemotePort, inspectLease, LEASE, remotePortAvailable, retireRemotePort } from './remote-ports.mjs';
+import { identityVerdict, readApplicationIdentity } from './app-identity.mjs';
 
 // Default platform handshake page. It must be the file the platform actually
 // serves: the single-page app owns every extension-less path, so a bare
@@ -65,6 +66,26 @@ const TRANSPORT_URL_PATTERN = /^wss:\/\/[a-zA-Z0-9.-]+(?::[0-9]+)?\/[a-zA-Z0-9/_
 // would report a working application as offline — the opposite of the problem
 // this field exists to fix. It therefore matches the connect budget, and the
 // probe's own request is a plain GET that the deployment answers within it.
+// The only values `status` may take. One place, because the field crosses the
+// gateway, the platform and the sidebar, and three of those used to spell the
+// same three strings out separately.
+//
+//   online    reachable, and — when the port makes a claim — the claim is ours
+//   offline   not reachable
+//   unknown   the probe did not answer within the budget; nothing was established
+//   mismatch  reachable, but the port says it is a DIFFERENT application
+//
+// `mismatch` is the one that did not exist before, and the reason it had to be
+// added: a port that serves somebody else's content answers 200, so every check
+// the gateway had called it reachable. Nothing anywhere compared what answered
+// against what was supposed to answer.
+export const APP_STATUS = Object.freeze({
+  ONLINE: 'online',
+  OFFLINE: 'offline',
+  UNKNOWN: 'unknown',
+  MISMATCH: 'mismatch',
+});
+
 const PROBE_TIMEOUT_MS = 3000;
 // The whole list shares one deadline, on top of the per-application timeout. With
 // a per-application budget alone, one unresponsive application per batch stretches
@@ -95,8 +116,16 @@ const PROBE_CONCURRENCY = 8;
 // trickles — a byte every few seconds, or a response line that never completes —
 // keeps a probe pending forever. A pending probe holds a slot in the concurrency
 // gate, and enough of them stop every other application from being probed at all.
-export function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
-  return new Promise(resolve => {
+export function probeApplication(remotePort, {
+  timeoutMs = PROBE_TIMEOUT_MS,
+  appId = null,
+  readIdentity = readApplicationIdentity,
+} = {}) {
+  // Reachability and identity are asked in parallel, not in sequence: the
+  // identity document has its own short timeout, and chaining the two would let
+  // a slow document spend the application's whole probe budget before the
+  // reachability answer was even attempted.
+  const reachable = new Promise(resolve => {
     let settled = false;
     let deadline = null;
     const finish = status => {
@@ -108,11 +137,23 @@ export function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = 
     };
     const request = http.request(
       { host: '127.0.0.1', port: remotePort, path: '/', method: 'GET' },
-      () => finish('online'),
+      () => finish(APP_STATUS.ONLINE),
     );
-    deadline = setTimeout(() => finish('offline'), timeoutMs);
-    request.on('error', () => finish('offline'));
+    deadline = setTimeout(() => finish(APP_STATUS.OFFLINE), timeoutMs);
+    request.on('error', () => finish(APP_STATUS.OFFLINE));
     request.end();
+  });
+
+  // No app id: there is nothing to compare a claim against, so this stays the
+  // pure reachability probe it has always been.
+  const identity = appId ? readIdentity(remotePort) : Promise.resolve(null);
+
+  return Promise.all([reachable, identity]).then(([status, claim]) => {
+    if (status !== APP_STATUS.ONLINE) return status;
+    // Only a positive claim of a different application is evidence. A port that
+    // claims nothing — most of the fleet predates the contract — answers exactly
+    // as it always has, so adopting this check cannot relabel working apps.
+    return identityVerdict(claim, appId) === 'other' ? APP_STATUS.MISMATCH : status;
   });
 }
 
@@ -132,7 +173,13 @@ export function probeApplication(remotePort, { timeoutMs = PROBE_TIMEOUT_MS } = 
 // that was removed and published again gets a new forwarding port, and answering
 // its id from the old port's entry would report reachability for a socket nobody
 // checked.
-export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, budgetMs = PROBE_BUDGET_MS, probe = probeApplication } = {}) {
+// The default probe adapts the `(port, appId)` seam to `probeApplication`'s
+// options object. Wired directly, the app id would arrive as `timeoutMs` and the
+// identity check would silently never run — the exact class of quiet failure
+// this work exists to remove.
+const defaultProbe = (port, appId) => probeApplication(port, { appId });
+
+export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROBE_CONCURRENCY, budgetMs = PROBE_BUDGET_MS, probe = defaultProbe } = {}) {
   // 'id:port' -> { status, at }
   const entries = new Map();
   // 'id:port' -> promise, so concurrent callers wanting the same target share one
@@ -168,19 +215,20 @@ export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROB
     return targets;
   }
 
-  function probeTarget({ key, port }) {
+  function probeTarget({ id, key, port }) {
     const running = inFlight.get(key);
     if (running) return running;
-    // A probe reports reachability and nothing else, so a probe that throws has
-    // established nothing and must not turn the list into a failure. The default
-    // probe already answers rather than throwing, but the seam is injectable, so
-    // the guarantee belongs here.
+    // A probe reports reachability and, when the port makes a claim, whether the
+    // claim is this application's. A probe that throws has established nothing
+    // and must not turn the list into a failure. The default probe already
+    // answers rather than throwing, but the seam is injectable, so the guarantee
+    // belongs here.
     const run = (async () => {
       await acquire();
       try {
-        return await probe(port);
+        return await probe(port, id);
       } catch {
-        return 'offline';
+        return APP_STATUS.OFFLINE;
       } finally {
         release();
       }
@@ -219,7 +267,7 @@ export function createStatusProbe({ cacheMs = PROBE_CACHE_MS, concurrency = PROB
     await Promise.race([settled, deadline]);
     clearTimeout(timer);
     for (const target of missing) {
-      statuses.set(target.id, answers.has(target.id) ? answers.get(target.id) : 'unknown');
+      statuses.set(target.id, answers.has(target.id) ? answers.get(target.id) : APP_STATUS.UNKNOWN);
     }
     return statuses;
   }
@@ -452,10 +500,9 @@ export function buildAppList(config, { updatedAt = null, agent = null, statuses 
       id: app.id,
       title: typeof app.title === 'string' && app.title.trim() ? app.title.trim() : app.id,
       url: `https://${host}/${app.id}/`,
-      // 'online' / 'offline' when a probe ran, and 'unknown' when the caller
-      // could not or did not probe. A list that cannot be probed still lists:
-      // saying nothing is better than claiming an application is reachable.
-      status: statuses?.get(app.id) ?? 'unknown',
+      // One of APP_STATUS. A list that could not be probed still lists: saying
+      // nothing is better than claiming an application is reachable.
+      status: statuses?.get(app.id) ?? APP_STATUS.UNKNOWN,
       updated_at: entryTimestamp(app),
     }));
 }
@@ -515,6 +562,10 @@ export function createControlPlane({
   remotePortBase = REMOTE_PORT_BASE,
   remotePortCeiling = REMOTE_PORT_CEILING,
   portAvailable = remotePortAvailable,
+  // Reading a port's identity claim is injectable for the same reason
+  // portAvailable is: the lease check must be testable without opening sockets,
+  // and a deployment that cannot reach loopback must still be able to start.
+  readAppIdentity = readApplicationIdentity,
   logger = console,
   handshakeUrl = DEFAULT_HANDSHAKE_URL,
   handshakeUrls = null,
@@ -691,10 +742,36 @@ export function createControlPlane({
     if (previous && String(previous.agent ?? '') !== agent) {
       return json(res, 409, { error: 'agent_mismatch' });
     }
-    // An update keeps the port the running connector was told to forward:
-    // moving it would break a tunnel that is already up.
+    // An update keeps the port the running connector was told to forward, but
+    // only while that port is still this application's.
+    //
+    // Keeping a port that answers as somebody else is exactly how a published
+    // application comes to serve another one's content: the mapping is wrong,
+    // every reachability check passes because something does answer, and nothing
+    // surfaces until a person notices by eye. The lease is the only place that
+    // can see this, because it is the only thing that knows which application
+    // the port was handed to.
+    //
+    // Moving the port costs the connector a restart, which is why it is done
+    // only on positive evidence (LEASE.FOREIGN). An inspection that found
+    // nothing, or errored, established nothing and must not churn a working
+    // tunnel.
     let remotePort = previous?.remotePort;
-    if (!previous) {
+    let reassignedFrom = null;
+    if (previous) {
+      let lease = LEASE.UNCLAIMED;
+      try {
+        lease = await inspectLease(previous.remotePort, {
+          appId: previous.id, readIdentity: readAppIdentity,
+        });
+      } catch (error) {
+        logger.error(JSON.stringify({
+          event: 'port_lease_inspection_failed', id: previous.id, message: error?.message,
+        }));
+      }
+      if (lease === LEASE.FOREIGN) reassignedFrom = previous.remotePort;
+    }
+    if (!previous || reassignedFrom !== null) {
       try {
         remotePort = await allocateRemotePort(current.config, {
           base: remotePortBase, ceiling: remotePortCeiling,
@@ -745,7 +822,10 @@ export function createControlPlane({
     const localPort = body.localPort === undefined || body.localPort === null ? previous?.localPort : body.localPort;
     if (localPort !== undefined && localPort !== null) entry.localPort = localPort;
     const status = previous ? 'updated' : 'registered';
-    const next = { ...current.config, apps: [...apps.filter(app => app.id !== id), entry] };
+    const baseConfig = reassignedFrom === null
+      ? current.config
+      : retireRemotePort(current.config, reassignedFrom);
+    const next = { ...baseConfig, apps: [...apps.filter(app => app.id !== id), entry] };
     // The renderer is the only validator: it already rejects a malformed id, a
     // duplicate port, a duplicate key, a non-ed25519 key and a bot uid that is
     // not a positive integer, for sshd and nginx alike.
@@ -764,6 +844,11 @@ export function createControlPlane({
     // the application is live, so the next request on this process must already
     // see it, and reading it back from disk keeps the file authoritative.
     view = viewOf(next, { updatedAt: configTimestamp() });
+    if (reassignedFrom !== null) {
+      logger.error(JSON.stringify({
+        event: 'port_lease_reassigned', id, from: reassignedFrom, to: remotePort,
+      }));
+    }
     return json(res, 201, registrationReply(view, entry, status));
   }
 
