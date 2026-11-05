@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { allocateRemotePort, remotePortAvailable, retireRemotePort } from '../src/remote-ports.mjs';
+import { allocateRemotePort, inspectLease, LEASE, remotePortAvailable, retireRemotePort } from '../src/remote-ports.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -135,4 +135,46 @@ test('legacy add-p0-app cannot bypass retirement or live listener checks', async
     assert.notEqual(run(port).status, 0);
     assert.deepEqual(f.read(), original);
   });
+});
+
+
+// What the port an application already holds is actually serving. This is the only
+// thing that can tell a working mapping from one that answers as somebody else:
+// both answer 200, so reachability cannot.
+
+test('a port that claims this application has a sound lease', async () => {
+  const lease = await inspectLease(28201, {
+    appId: 'board',
+    readIdentity: async () => ({ state: 'claimed', appId: 'board' }),
+  });
+  assert.equal(lease, LEASE.OURS);
+});
+
+test('a port that claims a different application is a broken lease', async () => {
+  const lease = await inspectLease(28201, {
+    appId: 'board',
+    readIdentity: async () => ({ state: 'claimed', appId: 'somebody-else' }),
+  });
+  assert.equal(lease, LEASE.FOREIGN);
+});
+
+test('a port that makes no claim leaves the lease alone', async () => {
+  // Most of the fleet predates the identity contract. Their ports must never be
+  // reported as foreign, or adopting the check would move every application.
+  for (const claim of [{ state: 'absent' }, { state: 'unusable' }, null]) {
+    const lease = await inspectLease(28201, { appId: 'board', readIdentity: async () => claim });
+    assert.equal(lease, claim?.state === 'unusable' ? LEASE.IDLE : LEASE.UNCLAIMED, JSON.stringify(claim));
+  }
+});
+
+test('an inspector that forgets the application id cannot declare the port foreign', async () => {
+  // Without a subject there is nothing to compare against. Treating that as
+  // "foreign" would let a missing argument alone move a working application.
+  for (const appId of [undefined, null, '', '   ']) {
+    const lease = await inspectLease(28201, {
+      appId,
+      readIdentity: async () => ({ state: 'claimed', appId: 'board' }),
+    });
+    assert.equal(lease, LEASE.UNCLAIMED, `appId ${JSON.stringify(appId)}`);
+  }
 });

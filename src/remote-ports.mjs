@@ -68,5 +68,8 @@ export async function inspectLease(remotePort, { appId, readIdentity = readAppli
   const claim = await readIdentity(remotePort);
   if (claim?.state === 'unusable') return LEASE.IDLE;
   if (claim?.state !== 'claimed') return LEASE.UNCLAIMED;
+  // Nothing to compare against: say so rather than guess. A caller that forgot
+  // the id must not be able to move an application off a working port.
+  if (typeof appId !== 'string' || !appId.trim()) return LEASE.UNCLAIMED;
   return identityVerdict(claim, appId) === 'other' ? LEASE.FOREIGN : LEASE.OURS;
 }

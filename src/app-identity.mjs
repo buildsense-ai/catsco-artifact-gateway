@@ -97,5 +97,9 @@ export function readApplicationIdentity(remotePort, {
 // it fires only when the port positively says it is somebody else.
 export function identityVerdict(claim, appId) {
   if (!claim || claim.state !== 'claimed') return 'unknown';
+  // Without an id there is nothing to compare against. Returning 'other' here
+  // would let a missing argument alone declare the port foreign and move a
+  // working application, so an absent subject answers "unknown" instead.
+  if (typeof appId !== 'string' || !appId.trim()) return 'unknown';
   return claim.appId === appId ? 'own' : 'other';
 }

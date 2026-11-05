@@ -6,7 +6,8 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, createStatusProbe, probeApplication, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createControlPlane, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createStatusProbe, probeApplication } from '../src/status-probe.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 import { remotePortAvailable } from '../src/remote-ports.mjs';
 import { APP_IDENTITY_CONTRACT, APP_IDENTITY_PATH } from '../src/app-identity.mjs';
@@ -1546,12 +1547,11 @@ function servesIdentity(appId, page = '<title>some page</title>') {
 
 test('a port that answers as a different application is a mismatch, not online', async () => {
   await withApplication(servesIdentity('hr-portal'), async port => {
-    assert.equal(await probeApplication(port, { appId: 'report-pa-project' }), 'mismatch');
+    const asOther = await createStatusProbe().probeAll([{ id: 'report-pa-project', remotePort: port }]);
+    assert.equal(asOther.get('report-pa-project'), 'mismatch');
     // The same port is correct for the application that actually owns it.
-    assert.equal(await probeApplication(port, { appId: 'hr-portal' }), 'online');
-    // With no id there is nothing to compare against: the probe keeps its old
-    // meaning, which is what every caller that does not know the id relies on.
-    assert.equal(await probeApplication(port), 'online');
+    const asOwn = await createStatusProbe().probeAll([{ id: 'hr-portal', remotePort: port }]);
+    assert.equal(asOwn.get('hr-portal'), 'online');
   });
 });
 
@@ -1562,12 +1562,73 @@ test('a port that makes no claim stays "online", so existing applications are un
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end('<title>legacy application</title>');
   }, async port => {
-    assert.equal(await probeApplication(port, { appId: 'report-pa-project' }), 'online');
+    const statuses = await createStatusProbe().probeAll([{ id: 'report-pa-project', remotePort: port }]);
+    assert.equal(statuses.get('report-pa-project'), 'online');
   });
 });
 
 test('an unreachable port is still offline, identity or not', async () => {
-  assert.equal(await probeApplication(1, { appId: 'demo', timeoutMs: 300 }), 'offline');
+  assert.equal(await probeApplication(1, { timeoutMs: 300 }), 'offline');
+  const statuses = await createStatusProbe().probeAll([{ id: 'demo', remotePort: 1 }]);
+  assert.equal(statuses.get('demo'), 'offline');
+});
+
+// ------------------------------------------------- identity must not starve the list
+//
+// These exist because the first version of this change asked reachability and
+// identity inside one slot and under one budget, and 141 applications then pushed
+// each other past the whole-list deadline: every entry came back `unknown` and the
+// sidebar read "unknown" for the entire fleet.
+
+test('a slow identity document cannot turn the fleet into unknowns', async () => {
+  const apps = Array.from({ length: 141 }, (_, i) => ({ id: `app-${i}`, remotePort: 30000 + i }));
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => {
+      identityCalls += 1;
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return { state: 'absent' };
+    },
+    cacheMs: 0,
+  });
+  const started = Date.now();
+  const statuses = await probe.probeAll(apps);
+  const counts = {};
+  for (const value of statuses.values()) counts[value] = (counts[value] || 0) + 1;
+
+  assert.equal(counts.online, 141, `every application stayed online: ${JSON.stringify(counts)}`);
+  assert.equal(counts.unknown, undefined);
+  // The identity pass is capped by its own budget, so the caller is never held
+  // for the sum of every application's identity latency.
+  assert.ok(Date.now() - started < 1500, `list answered in ${Date.now() - started}ms`);
+  assert.ok(identityCalls > 0, 'identity was still consulted');
+});
+
+test('an identity read that throws cannot make a reachable application offline', async () => {
+  // The reachability answer is the product; identity only refines it. A failure in
+  // the refinement must not downgrade a working application.
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => { throw new Error('socket exploded'); },
+    cacheMs: 0,
+  });
+  const statuses = await probe.probeAll([{ id: 'demo', remotePort: 28191 }]);
+  assert.equal(statuses.get('demo'), 'online');
+});
+
+test('identity is asked only about ports that answered', async () => {
+  const asked = [];
+  const probe = createStatusProbe({
+    probe: async port => (port === 28191 ? 'online' : 'offline'),
+    identity: async port => { asked.push(port); return { state: 'absent' }; },
+    cacheMs: 0,
+  });
+  await probe.probeAll([
+    { id: 'up', remotePort: 28191 },
+    { id: 'down', remotePort: 28192 },
+  ]);
+  assert.deepEqual(asked, [28191], 'a port nobody answers on cannot be serving somebody else');
 });
 
 test('an update moves the application off a port that answers as somebody else', async () => {
