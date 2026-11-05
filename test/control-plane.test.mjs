@@ -8,6 +8,7 @@ import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
 import { createControlPlane, createStatusProbe, probeApplication, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
+import { remotePortAvailable } from '../src/remote-ports.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
 const CONFIG = {
@@ -33,7 +34,7 @@ async function withServer(fn, options = {}) {
   // tests hand over a helper object that also carries `file` (the gateway config
   // they assert on), and a spread would make the viewer store write its state
   // into that very file.
-  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
+  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, portAvailable, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
   const store = new ViewerStore({ file: tmpState() });
   const server = createControlPlane({
     config: config || CONFIG,
@@ -45,6 +46,7 @@ async function withServer(fn, options = {}) {
     transportUrl,
     remotePortBase,
     remotePortCeiling,
+    portAvailable: portAvailable || (async () => true),
     handshakeUrl,
     handshakeUrls,
     platformIdentityUrl,
@@ -62,7 +64,7 @@ async function withServer(fn, options = {}) {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
-  try { return await fn({ base, store }); } finally { await new Promise(resolve => server.close(resolve)); }
+  try { return await fn({ base, store, server }); } finally { await new Promise(resolve => server.close(resolve)); }
 }
 
 async function issue(base, body) {
@@ -1341,8 +1343,8 @@ test('the production inventory reports each application\'s own time', async () =
 test('two registrations in flight both persist', async () => {
   const config = registrationConfig();
   await withServer(async ({ base }) => {
-    // The read-modify-write is synchronous inside each request, so the event
-    // loop cannot interleave two of them: no update can be lost.
+    // Port checks yield, so the mutation queue must keep both registrations
+    // rather than letting them read and overwrite the same config snapshot.
     const [one, two] = await Promise.all([
       apps(base, { method: 'POST', body: registration({ id: 'alpha', publicKey: 'ssh-ed25519 AAAAALPHA alpha' }) }),
       apps(base, { method: 'POST', body: registration({ id: 'beta', publicKey: 'ssh-ed25519 AAAABETA beta' }) }),
@@ -1388,6 +1390,112 @@ test('an exhausted port range is reported instead of reused', async () => {
     assert.match(res.body.message, /28200 and 28200/);
     assert.deepEqual(config.read(), config.content);
   }, { configPath: config.configPath, remotePortBase: 28200, remotePortCeiling: 28200 });
+});
+
+test('registration skips an orphaned listener that is absent from the config', async () => {
+  const orphan = net.createServer();
+  await new Promise(resolve => orphan.listen(0, '127.0.0.1', resolve));
+  const occupied = orphan.address().port;
+  const config = registrationConfig();
+  try {
+    await withServer(async ({ base }) => {
+      const result = await apps(base, { method: 'POST', body: registration() });
+      assert.equal(result.status, 409, 'an unregistered listener must not be routed as the new application');
+      assert.equal(result.body.error, 'no_free_remote_port');
+      assert.deepEqual(config.read(), config.content);
+    }, { ...config, remotePortBase: occupied, remotePortCeiling: occupied, portAvailable: remotePortAvailable });
+  } finally {
+    await new Promise(resolve => orphan.close(resolve));
+  }
+});
+
+test('deleted application ports stay retired across restarts even after their listener closes', async () => {
+  const orphan = net.createServer();
+  await new Promise(resolve => orphan.listen(0, '127.0.0.1', resolve));
+  const oldPort = orphan.address().port;
+  const config = registrationConfig([{ ...registration(), remotePort: oldPort }]);
+  const options = { ...config, remotePortBase: oldPort, remotePortCeiling: 65535 };
+  try {
+    await withServer(async ({ base }) => {
+      assert.equal((await apps(base, { method: 'DELETE', path: '/_gateway/apps/board' })).status, 200);
+      assert.deepEqual(config.read().retiredRemotePorts, [oldPort]);
+      const replacement = await apps(base, { method: 'POST', body: registration({ id: 'replacement' }) });
+      assert.equal(replacement.status, 201);
+      assert.notEqual(replacement.body.remote_port, oldPort);
+    }, options);
+  } finally {
+    await new Promise(resolve => orphan.close(resolve));
+  }
+  await withServer(async ({ base }) => {
+    const replacement = await apps(base, { method: 'POST', body: registration({ id: 'board', publicKey: 'ssh-ed25519 AAAARESTARTED board' }) });
+    assert.equal(replacement.status, 201, JSON.stringify(replacement.body));
+    assert.notEqual(replacement.body.remote_port, oldPort, 'reusing the id must not revive its old port');
+    assert.deepEqual(config.read().retiredRemotePorts, [oldPort]);
+  }, { ...options, config: config.read() });
+});
+
+test('port inspection errors refuse publication and do not block later mutations', async () => {
+  const config = registrationConfig();
+  let fail = true;
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration() });
+    assert.equal(result.status, 503);
+    assert.equal(result.body.error, 'port_allocation_unavailable');
+    assert.deepEqual(config.read(), config.content);
+    fail = false;
+    assert.equal((await apps(base, { method: 'POST', body: registration() })).status, 201);
+  }, { ...config, portAvailable: async () => { if (fail) throw new Error('socket inspection failed'); return true; } });
+});
+
+test('an update preserves its live port without trying to allocate it again', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+    assert.equal(result.body.title, 'New title');
+  }, { ...config, portAvailable: async () => { throw new Error('must not inspect an existing application port'); } });
+});
+
+test('a delete queued during port inspection cannot be undone by a stale registration snapshot', async () => {
+  const config = registrationConfig();
+  let inspected, release;
+  const inspecting = new Promise(resolve => { inspected = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  await withServer(async ({ base, server }) => {
+    const publishing = apps(base, { method: 'POST', body: registration() });
+    await inspecting;
+    const receivedDelete = new Promise(resolve => server.on('request', req => { if (req.method === 'DELETE') resolve(); }));
+    const deleting = apps(base, { method: 'DELETE', path: '/_gateway/apps/other' });
+    await receivedDelete;
+    release();
+    assert.equal((await publishing).status, 201);
+    assert.equal((await deleting).status, 200);
+    assert.deepEqual(config.read().apps.map(app => app.id), ['demo', 'board']);
+    assert.deepEqual(config.read().retiredRemotePorts, [28192]);
+  }, { ...config, portAvailable: async () => { inspected(); await gate; return true; } });
+});
+
+test('a config change during port inspection is re-read before publishing', async () => {
+  const config = registrationConfig();
+  let changed = false;
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration() });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, 28202);
+    assert.equal(config.read().apps[1].title, 'Changed by the operator');
+    assert.deepEqual(config.read().retiredRemotePorts, [28201]);
+  }, { ...config, portAvailable: async () => {
+    if (!changed) {
+      changed = true;
+      const next = config.read();
+      next.apps[1].title = 'Changed by the operator';
+      next.retiredRemotePorts = [28201];
+      fs.writeFileSync(config.file, JSON.stringify(next));
+    }
+    return true;
+  } });
 });
 
 test('registration is unavailable without a config file to write', async () => {

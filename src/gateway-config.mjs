@@ -1,4 +1,5 @@
 import { appTitle, bodySize, botUid, name, port } from './config.mjs';
+import { retiredRemotePorts } from './remote-ports.mjs';
 import { annotationRuntime, validateAppAnnotations, runtimeHttpConfig, runtimeLocation, runtimeAppConfig } from './annotation-runtime.mjs';
 
 // What an application may declare for its own request body, and what one that
@@ -17,7 +18,7 @@ export function renderGateway(c) {
   for (const field of ['hostKey', 'authorizedKeys']) if (!/^\/[a-zA-Z0-9/_.-]+$/.test(c[field])) throw new Error(`Invalid ${field}`);
   const controlPort = c.controlPort === undefined ? null : port(c.controlPort);
   const runtime = annotationRuntime(c);
-  const ids = new Set(), ports = new Set([c.sshPort, 22444, controlPort].filter(Boolean)), keys = new Set();
+  const ids = new Set(), ports = new Set([c.sshPort, 22444, controlPort, ...retiredRemotePorts(c)].filter(Boolean)), keys = new Set();
   for (const a of c.apps) {
     name(a.id); port(a.remotePort); validateAppAnnotations(a);
     if (ids.has(a.id) || ports.has(a.remotePort)) throw new Error('Duplicate application/port');
