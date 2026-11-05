@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { allocateRemotePort, inspectLease, LEASE, remotePortAvailable, retireRemotePort } from '../src/remote-ports.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
+import { APP_IDENTITY_CONTRACT, APP_IDENTITY_PATH } from '../src/app-identity.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const config = () => ({
@@ -177,4 +179,78 @@ test('an inspector that forgets the application id cannot declare the port forei
     });
     assert.equal(lease, LEASE.UNCLAIMED, `appId ${JSON.stringify(appId)}`);
   }
+});
+
+
+// The CLI is the second writer of gateway.json, and the only path an operator uses
+// to repair a bad mapping. These pin the two halves of that: a port that answers
+// as another application is refused, and one that answers as this application (or
+// says nothing at all) still updates.
+
+async function identityServer(appId, fn) {
+  const server = http.createServer((req, res) => {
+    if (req.url === APP_IDENTITY_PATH) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ contract: APP_IDENTITY_CONTRACT, app_id: appId }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<title>application</title>');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try { await fn(server.address().port); }
+  finally { await new Promise(resolve => server.close(resolve)); }
+}
+
+// The CLI is spawned asynchronously on purpose: spawnSync blocks this process,
+// so the identity server below could not answer while the CLI ran, and the check
+// would appear to pass by timing out rather than by deciding anything.
+function runRegistration(file, registrationFile) {
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, ['scripts/register-app.mjs', file, registrationFile], { cwd: root });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('close', status => resolve({ status, stdout, stderr }));
+  });
+}
+
+test('the CLI refuses to keep a port that answers as another application', async t => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  await identityServer('somebody-else', async port => {
+    const original = f.read();
+    original.apps[1].remotePort = port;
+    fs.writeFileSync(f.file, JSON.stringify(original));
+    const before = fs.readFileSync(f.file, 'utf8');
+
+    const result = await runRegistration(f.file, f.registration({ ...original.apps[1], title: 'Renamed' }));
+
+    assert.notEqual(result.status, 0, 'a foreign port must not be kept');
+    assert.match(result.stderr, /answers as another application/);
+    // Refusing is only useful if it refuses before writing: a half-applied
+    // rename would leave the file saying something the operator never approved.
+    assert.equal(fs.readFileSync(f.file, 'utf8'), before, 'the file must be untouched');
+  });
+});
+
+test('the CLI keeps a port that answers as this very application', async t => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  await identityServer('other', async port => {
+    const original = f.read();
+    original.apps[1].remotePort = port;
+    fs.writeFileSync(f.file, JSON.stringify(original));
+
+    const result = await runRegistration(f.file, f.registration({ ...original.apps[1], title: 'Renamed' }));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(f.read().apps.find(app => app.id === 'other').remotePort, port);
+  });
 });

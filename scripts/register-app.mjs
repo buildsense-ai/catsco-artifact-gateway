@@ -82,13 +82,17 @@ if (others.some(app => app.remotePort === entry.remotePort)) throw new Error(`Po
 const entryKey = entry.publicKey.split(' ')[1];
 if (others.some(app => app.publicKey.split(' ')[1] === entryKey)) throw new Error('This key is already registered to another application');
 
-// An operator editing the file by hand goes through the same lease authority as
-// the API, so a mapping that answers as another application cannot survive here
-// either.
+// An update through this script is held to the same lease rule as the API: a
+// mapping that answers as another application is not kept.
 //
-// Unlike the API, this script is told the port explicitly and cannot quietly
-// pick a different one: the operator typed the number. So the outcome is a
-// refusal that names what the port actually serves, not a silent move.
+// Unlike the API, the port here is typed by the operator, so this cannot pick a
+// different one on its own. The outcome is a refusal that names what the port
+// actually serves, not a silent move nobody asked for.
+//
+// Scope, stated because it is easy to assume more: this covers registrations
+// made through this script. Editing gateway.json by hand bypasses it entirely —
+// the file carries no enforcement of its own, and the API and this script are
+// the only two writers that ask.
 if (previous && previous.remotePort === entry.remotePort) {
   const lease = await inspectLease(entry.remotePort, { appId: entry.id });
   if (lease === LEASE.FOREIGN) {
