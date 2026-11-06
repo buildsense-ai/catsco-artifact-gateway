@@ -241,8 +241,15 @@ export function createStatusProbe({
 
   // What the port claims to be, from cache when it is fresh.
   //
-  //   'own' | 'other'   conclusive, cached for identityCacheMs
-  //   'unknown'         no claim, or the answer was unusable — not cached
+  // Cached: a claim naming an application (own / other), and a complete answer
+  // that names none ('absent' — the port says it has no identity document).
+  // Both are facts about the application, and both are expensive to re-establish
+  // for the whole fleet on every sidebar refresh.
+  //
+  // Not cached: 'unusable' — nothing answered, or the answer was cut short. That
+  // is a fact about the moment, not about the application, so the next refresh
+  // asks again. Caching it would silently skip the check for an application whose
+  // document was merely slow once.
   function verdictOf(target, now) {
     const cached = verdicts.get(target.key);
     if (cached && now - cached.at < identityCacheMs) return Promise.resolve(cached.verdict);
@@ -253,8 +260,10 @@ export function createStatusProbe({
       try {
         const claim = await identity(target.port);
         const verdict = identityVerdict(claim, target.id);
-        // An unusable answer is retried later; a definitive one is remembered.
-        if (verdict !== 'unknown') verdicts.set(target.key, { verdict, at: Date.now() });
+        // Every state except 'unusable' is a settled answer about this
+        // application, so it is remembered for the cache window. An application
+        // that adopts the contract later is picked up within one window.
+        if (claim?.state !== 'unusable') verdicts.set(target.key, { verdict, at: Date.now() });
         return verdict;
       } catch {
         // An identity read that throws says nothing about the application, so it

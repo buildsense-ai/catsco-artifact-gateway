@@ -1639,6 +1639,65 @@ test('the concurrency gate keeps its full width across refreshes', async () => {
   assert.deepEqual(peaks, [8, 8, 8], `gate width collapsed: ${JSON.stringify(peaks)}`);
 });
 
+test('a complete "no document" answer is cached, so a refresh does not re-ask the fleet', async () => {
+  // The fleet-wide case: every application predates the contract and answers 404
+  // once. Re-asking all of them on every sidebar refresh is a permanent cost paid
+  // for an answer that has not changed — measured at 141 requests per refresh
+  // before this was cached.
+  const apps = Array.from({ length: 20 }, (_, i) => ({ id: `app-${i}`, remotePort: 30000 + i }));
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => { identityCalls += 1; return { state: 'absent' }; },
+    cacheMs: 0,
+  });
+
+  identityCalls = 0;
+  await probe.probeAll(apps);
+  const firstRound = identityCalls;
+  await probe.probeAll(apps);
+  await probe.probeAll(apps);
+
+  assert.equal(firstRound, 20, 'the first round asks once per application');
+  assert.equal(identityCalls, 20, `later rounds must read the cache, got ${identityCalls} total`);
+});
+
+test('an answer that never arrived is not cached, so the next refresh asks again', async () => {
+  // 'unusable' means nothing answered or the answer was cut short. That is a fact
+  // about the moment, not about the application — remembering it would silently
+  // skip the check for an application whose document was merely slow once.
+  const apps = [{ id: 'slow', remotePort: 28191 }];
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => { identityCalls += 1; return { state: 'unusable' }; },
+    cacheMs: 0,
+  });
+
+  await probe.probeAll(apps);
+  await probe.probeAll(apps);
+  await probe.probeAll(apps);
+
+  assert.equal(identityCalls, 3, `an unsettled answer must be retried, got ${identityCalls}`);
+});
+
+test('a claim is cached, and a mismatch keeps being reported from cache', async () => {
+  const apps = [{ id: 'mine', remotePort: 28191 }];
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => {
+      identityCalls += 1;
+      return { state: 'claimed', appId: 'somebody-else' };
+    },
+    cacheMs: 0,
+  });
+
+  assert.equal((await probe.probeAll(apps)).get('mine'), 'mismatch');
+  assert.equal((await probe.probeAll(apps)).get('mine'), 'mismatch');
+  assert.equal(identityCalls, 1, 'a settled claim is read from cache');
+});
+
 test('an identity read that throws cannot make a reachable application offline', async () => {
   // The reachability answer is the product; identity only refines it. A failure in
   // the refinement must not downgrade a working application.
