@@ -14,8 +14,11 @@ import { identityVerdict, readApplicationIdentity } from './app-identity.mjs';
 //   listening, no answer the tunnel is up but nothing serves the local port
 //   listening, answered  both ends are up (any HTTP status counts, including 401)
 //
-// A probe therefore never decides whether an application is *correct*, only
-// whether it is reachable — an application that answers 500 is reachable.
+// `probeApplication` below therefore answers reachability and nothing else — an
+// application that answers 500 is reachable. Whether the thing that answered is
+// the right application is a second question, asked by `createStatusProbe` and
+// nowhere else; it is the only place that can turn a port serving somebody else
+// into `mismatch`.
 //
 // The timeout is set against what the deployment itself tolerates, not against
 // what feels fast. nginx allows an application 3s to accept the connection and

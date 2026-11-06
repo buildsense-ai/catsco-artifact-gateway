@@ -46,8 +46,11 @@ export async function allocateRemotePort(config, { base, ceiling, reserved, avai
 
 // What the port an application already holds is actually serving.
 //
-//   idle       nothing answers, or what answers is not HTTP. The tunnel is down;
-//              nobody else is using the port, so the lease stands.
+//   idle       the identity read established nothing: nothing answered, the answer
+//              did not arrive in time, or what answered was not HTTP. That is not
+//              evidence about ownership in either direction, so the lease stands.
+//              It does NOT mean the tunnel is down — a slow application lands here
+//              too, and moving it would be churn for no reason.
 //   ours       the port answers as this application.
 //   foreign    the port answers as a DIFFERENT application.
 //   unclaimed  the port answers but makes no claim, so there is nothing to compare.
