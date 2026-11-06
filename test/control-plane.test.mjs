@@ -1681,6 +1681,26 @@ test('an answer that never arrived is not cached, so the next refresh asks again
   assert.equal(identityCalls, 3, `an unsettled answer must be retried, got ${identityCalls}`);
 });
 
+test('an answer with no recognised state is not cached', async () => {
+  // The cache predicate names the states it trusts rather than excluding the ones
+  // it does not. This is the case that difference exists for: an identity reader
+  // that answers something the contract does not define (`null`, a missing
+  // `state`, a future state nobody taught the probe about) must not be remembered
+  // as a settled fact — that would skip the check for a whole window on the
+  // strength of an answer nobody understood.
+  for (const odd of [null, undefined, {}, { state: 'something-new' }]) {
+    let identityCalls = 0;
+    const probe = createStatusProbe({
+      probe: async () => 'online',
+      identity: async () => { identityCalls += 1; return odd; },
+      cacheMs: 0,
+    });
+    await probe.probeAll([{ id: 'demo', remotePort: 28191 }]);
+    await probe.probeAll([{ id: 'demo', remotePort: 28191 }]);
+    assert.equal(identityCalls, 2, `${JSON.stringify(odd)} must be asked again`);
+  }
+});
+
 test('a claim is cached, and a mismatch keeps being reported from cache', async () => {
   const apps = [{ id: 'mine', remotePort: 28191 }];
   let identityCalls = 0;

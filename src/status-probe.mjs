@@ -260,10 +260,15 @@ export function createStatusProbe({
       try {
         const claim = await identity(target.port);
         const verdict = identityVerdict(claim, target.id);
-        // Every state except 'unusable' is a settled answer about this
-        // application, so it is remembered for the cache window. An application
-        // that adopts the contract later is picked up within one window.
-        if (claim?.state !== 'unusable') verdicts.set(target.key, { verdict, at: Date.now() });
+        // Only a settled answer is remembered: a claim that names an application,
+        // or a complete answer that names none. Named as a whitelist on purpose —
+        // "everything except unusable" would silently start caching the next state
+        // anyone adds, and the cache is the one place where a wrong assumption
+        // hides a check for a full window. An application that adopts the contract
+        // later is picked up within one window.
+        if (claim?.state === 'claimed' || claim?.state === 'absent') {
+          verdicts.set(target.key, { verdict, at: Date.now() });
+        }
         return verdict;
       } catch {
         // An identity read that throws says nothing about the application, so it

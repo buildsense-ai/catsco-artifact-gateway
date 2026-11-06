@@ -77,8 +77,11 @@ export function readApplicationIdentity(remotePort, {
           if (!appId) { finish({ state: 'absent' }); return; }
           finish({ state: 'claimed', appId });
         });
-        // A body cut short by the deadline is not a claim either.
-        response.on('error', () => finish({ state: 'absent' }));
+        // A body cut short is not a claim — but it is also not evidence that the
+        // application has no document. Reporting it as 'absent' would make the
+        // probe cache "this application declares nothing" off one broken read, and
+        // that cached answer would skip the check for the whole window.
+        response.on('error', () => finish({ state: 'unusable' }));
       },
     );
     // Wall clock, not `timeout`: a body that trickles a byte at a time would

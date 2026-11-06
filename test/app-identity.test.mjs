@@ -99,6 +99,24 @@ test('an application that trickles a body cannot hold the probe open', async () 
   });
 });
 
+test('a body cut short mid-response is unusable, not "no document"', async () => {
+  // The distinct case this pins: the application DID answer, and it answered
+  // 200, but the body never arrived in full. Calling that 'absent' would say
+  // "this application declares no identity", which the probe then caches — and
+  // that cached answer would skip the real check for a whole window. It is a
+  // fact about the moment, so it must read as unusable and be asked again.
+  await withApp((req, res) => {
+    if (req.url !== APP_IDENTITY_PATH) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.write('{"contract":"' + APP_IDENTITY_CONTRACT + '","app_id":"dem');
+    // Close the socket before the JSON is complete.
+    setImmediate(() => res.destroy());
+  }, async port => {
+    const claim = await readApplicationIdentity(port);
+    assert.deepEqual(claim, { state: 'unusable' });
+  });
+});
+
 test('nothing listening is unusable, not a claim', async () => {
   // Port 1 on loopback is reliably closed in the test environment.
   assert.deepEqual(await readApplicationIdentity(1, { timeoutMs: 300 }), { state: 'unusable' });
