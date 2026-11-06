@@ -6,9 +6,11 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { ViewerStore, pseudonym, COOKIE_NAME, VIEWER_CONTRACT } from '../src/viewer-store.mjs';
-import { createControlPlane, createStatusProbe, probeApplication, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createControlPlane, buildAppList, matchBySuffix, safeNext, handshakeTarget, DEFAULT_HANDSHAKE_URL } from '../src/control-plane.mjs';
+import { createStatusProbe, probeApplication } from '../src/status-probe.mjs';
 import { renderGateway } from '../src/gateway-config.mjs';
 import { remotePortAvailable } from '../src/remote-ports.mjs';
+import { APP_IDENTITY_CONTRACT, APP_IDENTITY_PATH } from '../src/app-identity.mjs';
 
 const CONTROL_TOKEN = 'test-control-token-0123456789abcdef';
 const CONFIG = {
@@ -34,7 +36,7 @@ async function withServer(fn, options = {}) {
   // tests hand over a helper object that also carries `file` (the gateway config
   // they assert on), and a spread would make the viewer store write its state
   // into that very file.
-  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, portAvailable, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
+  const { config, configPath, transportUrl, remotePortBase, remotePortCeiling, portAvailable, readAppIdentity, handshakeUrl, handshakeUrls, platformIdentityUrl, platformCookieName, platformIdentityTimeoutMs, fetchImpl, statusProbe } = options;
   const store = new ViewerStore({ file: tmpState() });
   const server = createControlPlane({
     config: config || CONFIG,
@@ -47,6 +49,10 @@ async function withServer(fn, options = {}) {
     remotePortBase,
     remotePortCeiling,
     portAvailable: portAvailable || (async () => true),
+  // Same reason as portAvailable: the lease check must not depend on what is
+  // listening on the machine running the tests. The default reports "no claim",
+  // which is what an application predating the contract answers.
+  readAppIdentity: readAppIdentity || (async () => ({ state: 'unusable' })),
     handshakeUrl,
     handshakeUrls,
     platformIdentityUrl,
@@ -1510,3 +1516,307 @@ test('registration is unavailable without a config file to write', async () => {
 });
 
 
+// ---------------------------------------------------------------- identity
+//
+// What these cover: a port number says where traffic goes, never who answers.
+// Before this, a port serving somebody else's application answered 200, so
+// every reachability check called it healthy and the sidebar offered it as
+// normal. The identity document is the only thing that makes that visible.
+
+async function withApplication(handler, fn) {
+  const server = http.createServer(handler);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await fn(server.address().port, server);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
+}
+
+function servesIdentity(appId, page = '<title>some page</title>') {
+  return (req, res) => {
+    if (req.url === APP_IDENTITY_PATH) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ contract: APP_IDENTITY_CONTRACT, app_id: appId }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(page);
+  };
+}
+
+test('a port that answers as a different application is a mismatch, not online', async () => {
+  await withApplication(servesIdentity('hr-portal'), async port => {
+    const asOther = await createStatusProbe().probeAll([{ id: 'report-pa-project', remotePort: port }]);
+    assert.equal(asOther.get('report-pa-project'), 'mismatch');
+    // The same port is correct for the application that actually owns it.
+    const asOwn = await createStatusProbe().probeAll([{ id: 'hr-portal', remotePort: port }]);
+    assert.equal(asOwn.get('hr-portal'), 'online');
+  });
+});
+
+test('a port that makes no claim stays "online", so existing applications are unaffected', async () => {
+  // Everything published before the contract answers exactly like this. If this
+  // test ever flips, deploying the check would relabel the whole fleet.
+  await withApplication((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<title>legacy application</title>');
+  }, async port => {
+    const statuses = await createStatusProbe().probeAll([{ id: 'report-pa-project', remotePort: port }]);
+    assert.equal(statuses.get('report-pa-project'), 'online');
+  });
+});
+
+test('an unreachable port is still offline, identity or not', async () => {
+  assert.equal(await probeApplication(1, { timeoutMs: 300 }), 'offline');
+  const statuses = await createStatusProbe().probeAll([{ id: 'demo', remotePort: 1 }]);
+  assert.equal(statuses.get('demo'), 'offline');
+});
+
+// ------------------------------------------------- identity must not starve the list
+//
+// These exist because the first version of this change asked reachability and
+// identity inside one slot and under one budget, and 141 applications then pushed
+// each other past the whole-list deadline: every entry came back `unknown` and the
+// sidebar read "unknown" for the entire fleet.
+
+test('a slow identity document cannot turn the fleet into unknowns', async () => {
+  const apps = Array.from({ length: 141 }, (_, i) => ({ id: `app-${i}`, remotePort: 30000 + i }));
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => {
+      identityCalls += 1;
+      await new Promise(resolve => setTimeout(resolve, 300));
+      return { state: 'absent' };
+    },
+    cacheMs: 0,
+  });
+  const started = Date.now();
+  const statuses = await probe.probeAll(apps);
+  const counts = {};
+  for (const value of statuses.values()) counts[value] = (counts[value] || 0) + 1;
+
+  assert.equal(counts.online, 141, `every application stayed online: ${JSON.stringify(counts)}`);
+  assert.equal(counts.unknown, undefined);
+  // The identity pass is capped by its own budget, so the caller is never held
+  // for the sum of every application's identity latency.
+  assert.ok(Date.now() - started < 1500, `list answered in ${Date.now() - started}ms`);
+  assert.ok(identityCalls > 0, 'identity was still consulted');
+});
+
+test('the concurrency gate keeps its full width across refreshes', async () => {
+  // Regression: an earlier version kept a `held` flag per gate and consulted it
+  // in release. One gate serves many holders, so the first release cleared the
+  // flag and every other holder's release returned early without decrementing
+  // the count. The count only rose, and from the second refresh onward the probe
+  // ran one application at a time — the same whole-list timeout the two passes
+  // were meant to avoid, arrived at by a different route and never recovered.
+  const apps = Array.from({ length: 40 }, (_, i) => ({ id: `app-${i}`, remotePort: 30000 + i }));
+  let live = 0;
+  let peak = 0;
+  const probe = createStatusProbe({
+    cacheMs: 0,
+    probe: async () => {
+      live += 1;
+      peak = Math.max(peak, live);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      live -= 1;
+      return 'online';
+    },
+    identity: async () => ({ state: 'absent' }),
+  });
+
+  const peaks = [];
+  for (let round = 1; round <= 3; round += 1) {
+    peak = 0;
+    await probe.probeAll(apps);
+    peaks.push(peak);
+  }
+  // Width is what the deadline depends on: 40 applications at 5ms each fit in a
+  // single budget only while the gate runs wide. A leaking count shows up as a
+  // collapsing peak on the second round, not on the first.
+  assert.deepEqual(peaks, [8, 8, 8], `gate width collapsed: ${JSON.stringify(peaks)}`);
+});
+
+test('a complete "no document" answer is cached, so a refresh does not re-ask the fleet', async () => {
+  // The fleet-wide case: every application predates the contract and answers 404
+  // once. Re-asking all of them on every sidebar refresh is a permanent cost paid
+  // for an answer that has not changed — measured at 141 requests per refresh
+  // before this was cached.
+  const apps = Array.from({ length: 20 }, (_, i) => ({ id: `app-${i}`, remotePort: 30000 + i }));
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => { identityCalls += 1; return { state: 'absent' }; },
+    cacheMs: 0,
+  });
+
+  identityCalls = 0;
+  await probe.probeAll(apps);
+  const firstRound = identityCalls;
+  await probe.probeAll(apps);
+  await probe.probeAll(apps);
+
+  assert.equal(firstRound, 20, 'the first round asks once per application');
+  assert.equal(identityCalls, 20, `later rounds must read the cache, got ${identityCalls} total`);
+});
+
+test('an answer that never arrived is not cached, so the next refresh asks again', async () => {
+  // 'unusable' means nothing answered or the answer was cut short. That is a fact
+  // about the moment, not about the application — remembering it would silently
+  // skip the check for an application whose document was merely slow once.
+  const apps = [{ id: 'slow', remotePort: 28191 }];
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => { identityCalls += 1; return { state: 'unusable' }; },
+    cacheMs: 0,
+  });
+
+  await probe.probeAll(apps);
+  await probe.probeAll(apps);
+  await probe.probeAll(apps);
+
+  assert.equal(identityCalls, 3, `an unsettled answer must be retried, got ${identityCalls}`);
+});
+
+test('an answer with no recognised state is not cached', async () => {
+  // The cache predicate names the states it trusts rather than excluding the ones
+  // it does not. This is the case that difference exists for: an identity reader
+  // that answers something the contract does not define (`null`, a missing
+  // `state`, a future state nobody taught the probe about) must not be remembered
+  // as a settled fact — that would skip the check for a whole window on the
+  // strength of an answer nobody understood.
+  for (const odd of [null, undefined, {}, { state: 'something-new' }]) {
+    let identityCalls = 0;
+    const probe = createStatusProbe({
+      probe: async () => 'online',
+      identity: async () => { identityCalls += 1; return odd; },
+      cacheMs: 0,
+    });
+    await probe.probeAll([{ id: 'demo', remotePort: 28191 }]);
+    await probe.probeAll([{ id: 'demo', remotePort: 28191 }]);
+    assert.equal(identityCalls, 2, `${JSON.stringify(odd)} must be asked again`);
+  }
+});
+
+test('a claim is cached, and a mismatch keeps being reported from cache', async () => {
+  const apps = [{ id: 'mine', remotePort: 28191 }];
+  let identityCalls = 0;
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => {
+      identityCalls += 1;
+      return { state: 'claimed', appId: 'somebody-else' };
+    },
+    cacheMs: 0,
+  });
+
+  assert.equal((await probe.probeAll(apps)).get('mine'), 'mismatch');
+  assert.equal((await probe.probeAll(apps)).get('mine'), 'mismatch');
+  assert.equal(identityCalls, 1, 'a settled claim is read from cache');
+});
+
+test('an identity read that throws cannot make a reachable application offline', async () => {
+  // The reachability answer is the product; identity only refines it. A failure in
+  // the refinement must not downgrade a working application.
+  const probe = createStatusProbe({
+    probe: async () => 'online',
+    identity: async () => { throw new Error('socket exploded'); },
+    cacheMs: 0,
+  });
+  const statuses = await probe.probeAll([{ id: 'demo', remotePort: 28191 }]);
+  assert.equal(statuses.get('demo'), 'online');
+});
+
+test('identity is asked only about ports that answered', async () => {
+  const asked = [];
+  const probe = createStatusProbe({
+    probe: async port => (port === 28191 ? 'online' : 'offline'),
+    identity: async port => { asked.push(port); return { state: 'absent' }; },
+    cacheMs: 0,
+  });
+  await probe.probeAll([
+    { id: 'up', remotePort: 28191 },
+    { id: 'down', remotePort: 28192 },
+  ]);
+  assert.deepEqual(asked, [28191], 'a port nobody answers on cannot be serving somebody else');
+});
+
+test('an update moves the application off a port that answers as somebody else', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    // The mapping was wrong, so it must not be kept: this is the only path that
+    // repairs an application that has been serving the wrong content since
+    // before ports were checked on the way out.
+    assert.notEqual(result.body.remote_port, original.remotePort);
+    assert.equal(result.body.title, 'New title');
+  }, {
+    ...config,
+    readAppIdentity: async port => (port === 28201
+      ? { state: 'claimed', appId: 'somebody-else' }
+      : { state: 'unusable' }),
+  });
+  // The port we walked away from must never be handed out again: an old session
+  // may still hold it, which is the same reason a deleted application's port is
+  // retired.
+  assert.deepEqual(config.read().retiredRemotePorts, [original.remotePort]);
+});
+
+test('an update keeps its port when nothing claims it', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+  }, { ...config, readAppIdentity: async () => ({ state: 'unusable' }) });
+  assert.equal(config.read().retiredRemotePorts, undefined, 'nothing to retire when the lease still stands');
+});
+
+test('an update keeps its port when the port claims this very application', async () => {
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+  }, {
+    ...config,
+    readAppIdentity: async () => ({ state: 'claimed', appId: 'board' }),
+  });
+});
+
+test('an inspection that throws does not move a working application', async () => {
+  // A socket error while inspecting is not evidence that the port is wrong.
+  // Churning the port there would break a working tunnel for an unrelated
+  // failure, which is the opposite of what this check is for.
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    const result = await apps(base, { method: 'POST', body: registration({ title: 'New title' }) });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.remote_port, original.remotePort);
+  }, {
+    ...config,
+    readAppIdentity: async () => { throw new Error('socket exploded'); },
+  });
+});
+
+test('a registration still never moves an existing application for no reason', async () => {
+  // The inverse guard: the lease check must not become a reason to reallocate on
+  // every publish. With no claim there is nothing to react to.
+  const original = { id: 'board', title: 'Old title', agent: '365', remotePort: 28201, publicKey: 'ssh-ed25519 AAAABOARD board' };
+  const config = registrationConfig([original]);
+  await withServer(async ({ base }) => {
+    for (const title of ['A', 'B', 'C']) {
+      const result = await apps(base, { method: 'POST', body: registration({ title }) });
+      assert.equal(result.status, 201);
+      assert.equal(result.body.remote_port, original.remotePort, `publish ${title} kept the port`);
+    }
+  }, { ...config, readAppIdentity: async () => ({ state: 'absent' }) });
+});

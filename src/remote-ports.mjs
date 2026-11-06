@@ -1,5 +1,6 @@
 import net from 'node:net';
 import { port } from './config.mjs';
+import { identityVerdict, readApplicationIdentity } from './app-identity.mjs';
 
 // Removing an authorized key does not close an authenticated SSH session. Keep
 // its forwarding port retired across restarts, even after the listener goes
@@ -41,4 +42,37 @@ export async function allocateRemotePort(config, { base, ceiling, reserved, avai
     if (!used.has(candidate) && await available(candidate)) return candidate;
   }
   return null;
+}
+
+// What the port an application already holds is actually serving.
+//
+//   idle       the identity read established nothing: nothing answered, the answer
+//              did not arrive in time, or what answered was not HTTP. That is not
+//              evidence about ownership in either direction, so the lease stands.
+//              It does NOT mean the tunnel is down — a slow application lands here
+//              too, and moving it would be churn for no reason.
+//   ours       the port answers as this application.
+//   foreign    the port answers as a DIFFERENT application.
+//   unclaimed  the port answers but makes no claim, so there is nothing to compare.
+//
+// `unclaimed` and `idle` are not failures. Most of the fleet predates the
+// identity contract, and a stopped connector cannot say anything at all. Only
+// `foreign` is positive evidence that the port no longer belongs here, and only
+// it justifies moving an application to a new port.
+export const LEASE = Object.freeze({
+  IDLE: 'idle',
+  OURS: 'ours',
+  FOREIGN: 'foreign',
+  UNCLAIMED: 'unclaimed',
+});
+
+export async function inspectLease(remotePort, { appId, readIdentity = readApplicationIdentity } = {}) {
+  port(remotePort);
+  const claim = await readIdentity(remotePort);
+  if (claim?.state === 'unusable') return LEASE.IDLE;
+  if (claim?.state !== 'claimed') return LEASE.UNCLAIMED;
+  // Nothing to compare against: say so rather than guess. A caller that forgot
+  // the id must not be able to move an application off a working port.
+  if (typeof appId !== 'string' || !appId.trim()) return LEASE.UNCLAIMED;
+  return identityVerdict(claim, appId) === 'other' ? LEASE.FOREIGN : LEASE.OURS;
 }
