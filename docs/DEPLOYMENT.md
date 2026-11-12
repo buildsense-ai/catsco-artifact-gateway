@@ -40,11 +40,13 @@ WSS adapter 同时最多承载 `TUNNEL_MAX_CONNECTIONS` 条隧道，默认 **160
 
 ```sh
 install -m 755 deploy/apply-config.sh /opt/catsco-artifact-gateway/deploy/apply-config.sh
-install -m 644 deploy/cag-apply.service deploy/cag-apply.path /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now cag-apply.path
+install -m 644 deploy/cag-apply.service deploy/cag-apply.path deploy/cag-apply.timer /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now cag-apply.path cag-apply.timer
 ```
 
 `cag-apply.path` 监听 `gateway.json` 变化 → `cag-apply.service` 渲染四个文件：`nginx -t` 通过才 reload nginx，`sshd -t` 通过才 restart `catsco-artifact-gateway-p0`。不通过就不动正在跑的服务，因此不需要回滚框架。`cag_ingress` 仍然没有 sudo，root 侧只对一个「本来就只有它可写」的文件做出反应，攻击面等于原来的 `scripts/register-app.mjs`。
+
+保留 path 以低延迟响应原地写入；service 启动前等待 1 秒合并连续写入、避免紧循环，并用 `[Unit] StartLimitIntervalSec=0` 防止频繁成功 apply 耗尽启动限流、导致 path 失效。`cag-apply.timer` 在开机 30 秒后触发，此后每次 service 退出 60 秒后再次校准（`AccuracySec=1s`），为漏事件提供约一分钟兜底。CI 每次部署都会安装并启用 path 和 timer。
 
 文件名与实际路径映射（2026-09-20 在 catsco-prod 只读确认）：`sshd`→`/etc/catsco-artifact-gateway/sshd`、`authorizedKeys`→`/etc/catsco-artifact-gateway/authorized_keys`、`locations`→`/etc/catsco-artifact-gateway/artifact-locations.conf`、`nginx`→`/etc/nginx/conf.d/catsco-artifact-gateway-p0.conf`。
 
