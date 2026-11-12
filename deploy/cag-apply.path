@@ -4,9 +4,9 @@
 # that only that unprivileged service can write, so its attack surface equals
 # today's scripts/register-app.mjs. No sudoers entry, no second daemon.
 #
-# src/control-plane.mjs replaces gateway.json with tmp + rename, i.e. the watcher
-# only ever observes a complete file; a duplicate or spurious trigger is harmless
-# because apply-config.sh installs nothing when the rendered content is equal.
+# src/control-plane.mjs writes gateway.json in place. The service waits one
+# second to coalesce consecutive writes; the timer reconciles missed events.
+# Duplicate triggers are harmless: unchanged rendered content is not installed.
 [Unit]
 Description=Watch the Artifact gateway config for control-plane writes
 

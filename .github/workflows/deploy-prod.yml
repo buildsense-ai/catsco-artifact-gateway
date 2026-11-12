@@ -1,6 +1,6 @@
 name: Deploy Artifact Gateway
 
-# The gateway is not a container: it is source files, one root helper and two
+# The gateway is not a container: it is source files, one root helper and
 # systemd units on the gateway host. Deploying therefore means "copy the source,
 # make sure the units are installed and current, apply the config, restart the
 # control plane" — and it has to be idempotent, because it also runs on every
@@ -69,8 +69,8 @@ jobs:
         run: ssh cag "sudo -n -u cag_ingress test -r $GATEWAY_ROOT/node_modules/ws/index.js || { echo 'node_modules/ws is not readable by the service user — run npm ci and fix permissions in $GATEWAY_ROOT on the gateway host'; exit 1; }"
 
       - name: Install or refresh the units
-        # Everything here is idempotent: the root helper, the path unit that
-        # watches gateway.json, and the two long-running units. The control plane
+        # Everything here is idempotent: the root helper, the path watcher and
+        # reconciliation timer, and the two long-running units. The control plane
         # needs ReadWritePaths, or the registration API cannot write its own
         # config. The WSS adapter is installed here too, or a change to its limit
         # would be copied to the host and never take effect: it reads that file
@@ -78,11 +78,11 @@ jobs:
         run: |
           ssh cag "set -e
             sudo -n chmod 755 $GATEWAY_ROOT/deploy/apply-config.sh
-            sudo -n install -m 644 $GATEWAY_ROOT/deploy/cag-apply.service $GATEWAY_ROOT/deploy/cag-apply.path /etc/systemd/system/
+            sudo -n install -m 644 $GATEWAY_ROOT/deploy/cag-apply.service $GATEWAY_ROOT/deploy/cag-apply.path $GATEWAY_ROOT/deploy/cag-apply.timer /etc/systemd/system/
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/control-plane.service /etc/systemd/system/$UNIT.service
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/ws-gateway.service /etc/systemd/system/$WSS_UNIT.service
             sudo -n systemctl daemon-reload
-            sudo -n systemctl enable --now cag-apply.path"
+            sudo -n systemctl enable --now cag-apply.path cag-apply.timer"
 
       - name: Apply the current config
         # Installing the watcher applies nothing by itself: it reacts to a change.

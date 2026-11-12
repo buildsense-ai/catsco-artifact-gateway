@@ -1,0 +1,12 @@
+# Reconcile the config even if a filesystem event was missed.
+[Unit]
+Description=Periodically reconcile the Artifact gateway config
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Unit=cag-apply.service
+
+[Install]
+WantedBy=timers.target
