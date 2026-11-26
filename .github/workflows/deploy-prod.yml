@@ -51,8 +51,8 @@ jobs:
           EOF
           chmod 600 ~/.ssh/config
 
-      - name: Verify the annotation runtime manifest
-        run: node --test test/annotation-runtime.test.mjs
+      - name: Verify the runtime manifests
+        run: node --test test/annotation-runtime.test.mjs test/webmcp-runtime.test.mjs
 
       - name: Upload the source and fixed annotation runtime
         run: |
@@ -83,6 +83,43 @@ jobs:
             sudo -n install -m 644 $GATEWAY_ROOT/deploy/ws-gateway.service /etc/systemd/system/$WSS_UNIT.service
             sudo -n systemctl daemon-reload
             sudo -n systemctl enable --now cag-apply.path"
+
+      - name: Ensure webmcpRuntime is enabled in gateway.json
+        # Idempotently seed webmcpRuntime on the gateway host when absent, validating
+        # with the deployed renderer before atomically replacing gateway.json.
+        run: |
+          ssh cag "sudo -n /bin/sh -eu" <<'EOF'
+          CONF=/etc/catsco-artifact-gateway/gateway.json
+          RENDER=/opt/catsco-artifact-gateway/scripts/render.mjs
+          NODE=/usr/local/bin/node
+          TMP=$(mktemp -d /run/cag-webmcp-enable.XXXXXX)
+          trap 'rm -rf "$TMP"' EXIT
+          changed=$("$NODE" -e '
+            const fs = require("node:fs");
+            const conf = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (conf.webmcpRuntime !== undefined) {
+              process.stdout.write("no");
+              process.exit(0);
+            }
+            conf.webmcpRuntime = {
+              enabled: true,
+              directory: "/opt/catsco-artifact-gateway/public/runtime",
+              defaultEnabled: true,
+              parentOrigins: ["https://app.catsco.cc", "https://app.catsco.cn"]
+            };
+            fs.writeFileSync(process.argv[2], JSON.stringify(conf, null, 2) + "\n", { mode: 0o600 });
+            process.stdout.write("yes");
+          ' "$CONF" "$TMP/gateway.json")
+          if [ "$changed" = "yes" ]; then
+            "$NODE" "$RENDER" "$TMP/gateway.json" "$TMP/out"
+            [ -e "$CONF.pre-webmcp.bak" ] || cp -p "$CONF" "$CONF.pre-webmcp.bak"
+            install -o cag_ingress -g cag_ingress -m 600 "$TMP/gateway.json" "$CONF.new"
+            mv -f "$CONF.new" "$CONF"
+            echo "enabled webmcpRuntime in $CONF"
+          else
+            echo "webmcpRuntime already configured in $CONF"
+          fi
+          EOF
 
       - name: Apply the current config
         # Installing the watcher applies nothing by itself: it reacts to a change.
@@ -119,7 +156,7 @@ jobs:
           # a deploy that left the limit at its old default would otherwise pass.
           health=$(ssh cag "curl -fsS http://127.0.0.1:22444/health")
           echo "wss health: $health"
-          echo "$health" | grep -q "\"maxConnections\":$EXPECTED_TUNNEL_MAX"
+          node -e 'const h = JSON.parse(process.argv[1]); const min = Number(process.env.EXPECTED_TUNNEL_MAX); if (!h.ok || !(h.maxConnections >= min)) { console.error("unexpected wss health:", h, "expected >=", min); process.exit(1); }' "$health"
 
       - name: Verify
         run: |
@@ -133,4 +170,7 @@ jobs:
             code=$(curl -s -o /dev/null -w '%{http_code}' "https://$host/_gateway/apps")
             echo "$host /_gateway/apps -> $code"
             test "$code" = "401"
+            webmcp_code=$(curl -s -o /dev/null -w '%{http_code}' "https://$host/_catsco/runtime/webmcp-v1.js")
+            echo "$host /_catsco/runtime/webmcp-v1.js -> $webmcp_code"
+            test "$webmcp_code" = "200"
           done
