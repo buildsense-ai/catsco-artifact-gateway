@@ -72,6 +72,7 @@ const entry = {
   maxBody: registration.maxBody ?? previous?.maxBody,
   // Registration is not an operator approval to inject runtime code.
   annotations: previous?.annotations,
+  webmcp: previous?.webmcp,
   // Same rule the API applies, for the same reason: without a stamp of its own
   // this entry answers with the config file's timestamp, so every later write
   // would appear to have updated it too.

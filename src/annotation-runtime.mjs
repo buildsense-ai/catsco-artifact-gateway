@@ -79,7 +79,7 @@ map $cag_annotation_eligible $cag_annotation_body { default ""; 1 "</body>"; }
 `;
 }
 
-export function runtimeLocation(runtime) {
+export function runtimeAssetLocations(runtime) {
   // Keep the executable resource set explicit, independent of request/query or
   // manifest data. Renderer is loaded on demand by the canonical SDK.
   return [[RUNTIME_URL, RUNTIME_FILENAME], [RENDERER_URL, RENDERER_FILENAME], [LEGACY_RENDERER_URL, LEGACY_RENDERER_FILENAME]].map(([url, filename]) => `# Fixed vendored asset only. No user-selected path, upstream URL or token.
@@ -94,11 +94,15 @@ location = ${url} {
  add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'" always;
  add_header Referrer-Policy "no-referrer" always;
 }
-`).join('') + 'location ^~ /_catsco/runtime/ { return 404; }\n';
+`).join('');
 }
 
-export function runtimeAppConfig(runtime) {
-  const tag = runtimeScript(runtime);
+export function runtimeLocation(runtime) {
+  return runtimeAssetLocations(runtime) + 'location ^~ /_catsco/runtime/ { return 404; }\n';
+}
+
+export function runtimeFilterAppConfig(tags) {
+  const combined = Array.isArray(tags) ? tags.join('') : String(tags);
   return ` # Opt-in external runtime; upstream CSP headers remain untouched.
  proxy_set_header Accept-Encoding $cag_annotation_encoding;
  # Do not negotiate a 304 for a response whose bytes we may transform.
@@ -113,7 +117,11 @@ export function runtimeAppConfig(runtime) {
  sub_filter_last_modified off;
  # nginx cannot make the body fallback conditional on seeing a head. Both
  # markers are safe: the SDK's top-level singleton prevents double listeners.
- sub_filter $cag_annotation_head ${nginxQuote(tag + '</head>')};
- sub_filter $cag_annotation_body ${nginxQuote(tag + '</body>')};
+ sub_filter $cag_annotation_head ${nginxQuote(combined + '</head>')};
+ sub_filter $cag_annotation_body ${nginxQuote(combined + '</body>')};
 `;
+}
+
+export function runtimeAppConfig(runtime) {
+  return runtimeFilterAppConfig([runtimeScript(runtime)]);
 }

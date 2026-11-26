@@ -1,0 +1,18 @@
+{
+  "contract_version": "catsco.gateway-webmcp-runtime-export.v1",
+  "runtime_path": "/_catsco/runtime/webmcp-v1.js",
+  "config_attribute": "data-catsco-parent-origins",
+  "source": "public/runtime/webmcp-v1.js",
+  "sha256": "da0086c9ab444974f0aedfcaacc1b77edc27902f2c3af9a94eeb68ec820938c1",
+  "bytes": 18217,
+  "resources": [
+    {
+      "filename": "webmcp-v1.js",
+      "runtime_path": "/_catsco/runtime/webmcp-v1.js",
+      "source": "public/runtime/webmcp-v1.js",
+      "sha256": "80c4b583511e09dcd55fdd0e2acb1990101463605a76f91b7e98defed314c415",
+      "bytes": 16675,
+      "mime_type": "application/javascript"
+    }
+  ]
+}

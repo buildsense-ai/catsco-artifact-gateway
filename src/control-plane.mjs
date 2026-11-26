@@ -577,9 +577,10 @@ export function createControlPlane({
       // the value, so a declaration above the ceiling is refused as an invalid
       // registration instead of being stored.
       maxBody: text(body.maxBody) ?? previous?.maxBody,
-      // Annotation opt-in is operator-owned gateway configuration. Publishing
-      // or updating an app must neither enable it nor erase an existing flag.
+      // Annotation and WebMCP opt-ins are operator-owned gateway configuration.
+      // Publishing or updating an app must neither enable them nor erase existing flags.
       annotations: previous?.annotations,
+      webmcp: previous?.webmcp,
       // This entry's own last-changed time. Without it every application in the
       // list inherits the config file's timestamp, so one publish appears to
       // have updated all of them at once and the sidebar's recency sort stops

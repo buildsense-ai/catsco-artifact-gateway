@@ -1,6 +1,7 @@
 import { appTitle, bodySize, botUid, name, port } from './config.mjs';
 import { retiredRemotePorts } from './remote-ports.mjs';
-import { annotationRuntime, validateAppAnnotations, runtimeHttpConfig, runtimeLocation, runtimeAppConfig } from './annotation-runtime.mjs';
+import { annotationRuntime, validateAppAnnotations, runtimeHttpConfig, runtimeAssetLocations, runtimeScript, runtimeFilterAppConfig } from './annotation-runtime.mjs';
+import { webmcpRuntime, validateAppWebMcp, webmcpRuntimeAssetLocation, webmcpRuntimeScript } from './webmcp-runtime.mjs';
 
 // What an application may declare for its own request body, and what one that
 // declares nothing keeps. Most applications are pages, so the default stays
@@ -18,9 +19,10 @@ export function renderGateway(c) {
   for (const field of ['hostKey', 'authorizedKeys']) if (!/^\/[a-zA-Z0-9/_.-]+$/.test(c[field])) throw new Error(`Invalid ${field}`);
   const controlPort = c.controlPort === undefined ? null : port(c.controlPort);
   const runtime = annotationRuntime(c);
+  const webmcp = webmcpRuntime(c);
   const ids = new Set(), ports = new Set([c.sshPort, 22444, controlPort, ...retiredRemotePorts(c)].filter(Boolean)), keys = new Set();
   for (const a of c.apps) {
-    name(a.id); port(a.remotePort); validateAppAnnotations(a);
+    name(a.id); port(a.remotePort); validateAppAnnotations(a); validateAppWebMcp(a);
     if (ids.has(a.id) || ports.has(a.remotePort)) throw new Error('Duplicate application/port');
     ids.add(a.id); ports.add(a.remotePort);
     if (a.agent !== undefined) botUid(a.agent);
@@ -54,7 +56,12 @@ location ^~ /_launch/ { proxy_pass http://127.0.0.1:${controlPort}; proxy_set_he
 # never be able to starve the identity/launch endpoints a browser needs to open an
 # application at all. Sharing one zone made an application's own asset burst
 # reject the launch that followed it.
-limit_req_zone $binary_remote_addr zone=cag_p0_requests:1m rate=50r/s;\nlimit_req_zone $binary_remote_addr zone=cag_p0_control:1m rate=20r/s;\nlimit_conn_zone $binary_remote_addr zone=cag_p0_connections:1m;\nlimit_conn_zone $binary_remote_addr zone=cag_p0_control_connections:1m;\nmap $http_upgrade $cag_p0_upgrade { default upgrade; '' close; }\n` + (runtime ? runtimeHttpConfig() : ''),
-    locations: `# Include only in dedicated Artifact virtual hosts.\nlocation = /_gateway/tunnel {\n proxy_pass http://127.0.0.1:22444/tunnel;\n proxy_http_version 1.1;\n proxy_set_header Upgrade $http_upgrade;\n proxy_set_header Connection "upgrade";\n proxy_set_header Cookie "";\n proxy_read_timeout 65s;\n proxy_buffering off;\n limit_req zone=cag_p0_requests burst=10 nodelay;\n limit_conn cag_p0_connections 50;\n}\n` + control + (runtime ? runtimeLocation(runtime) : '') + c.apps.map(a => `location = /${a.id} { return 308 /${a.id}/; }\nlocation ^~ /${a.id}/ {\n proxy_pass http://127.0.0.1:${a.remotePort}/;\n proxy_http_version 1.1;\n proxy_set_header Host $host;\n proxy_set_header Upgrade $http_upgrade;\n proxy_set_header Connection $cag_p0_upgrade;\n proxy_set_header X-Forwarded-Proto https;\n proxy_set_header X-Forwarded-For $remote_addr;\n proxy_buffering off;\n${runtime && (a.annotations === true || (runtime.defaultEnabled && a.annotations !== false)) ? runtimeAppConfig(runtime) : ''} proxy_read_timeout 65s;\n proxy_connect_timeout 3s;\n client_max_body_size ${a.maxBody ?? defaultMaxBody};\n limit_req zone=cag_p0_requests burst=100 nodelay;\n limit_conn cag_p0_connections 50;\n add_header Cache-Control "no-store" always;\n add_header X-Content-Type-Options "nosniff" always;\n add_header Referrer-Policy "no-referrer" always;\n add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src ${hosts.map(h => `https://${h}/${a.id}/ wss://${h}/${a.id}/`).join(' ')}; media-src 'self' blob:; img-src 'self' data: blob:; font-src 'self' data:; frame-src ${hosts.map(h => `https://${h}/${a.id}/`).join(' ')} blob:; base-uri 'none'; form-action 'none'; worker-src 'self' blob:; object-src 'none'" always;\n}\n`).join('')
+limit_req_zone $binary_remote_addr zone=cag_p0_requests:1m rate=50r/s;\nlimit_req_zone $binary_remote_addr zone=cag_p0_control:1m rate=20r/s;\nlimit_conn_zone $binary_remote_addr zone=cag_p0_connections:1m;\nlimit_conn_zone $binary_remote_addr zone=cag_p0_control_connections:1m;\nmap $http_upgrade $cag_p0_upgrade { default upgrade; '' close; }\n` + (runtime || webmcp ? runtimeHttpConfig() : ''),
+    locations: `# Include only in dedicated Artifact virtual hosts.\nlocation = /_gateway/tunnel {\n proxy_pass http://127.0.0.1:22444/tunnel;\n proxy_http_version 1.1;\n proxy_set_header Upgrade $http_upgrade;\n proxy_set_header Connection "upgrade";\n proxy_set_header Cookie "";\n proxy_read_timeout 65s;\n proxy_buffering off;\n limit_req zone=cag_p0_requests burst=10 nodelay;\n limit_conn cag_p0_connections 50;\n}\n` + control + (runtime || webmcp ? (runtime ? runtimeAssetLocations(runtime) : '') + (webmcp ? webmcpRuntimeAssetLocation(webmcp) : '') + 'location ^~ /_catsco/runtime/ { return 404; }\n' : '') + c.apps.map(a => {
+      const tags = [];
+      if (runtime && (a.annotations === true || (runtime.defaultEnabled && a.annotations !== false))) tags.push(runtimeScript(runtime));
+      if (webmcp && (a.webmcp === true || (webmcp.defaultEnabled && a.webmcp !== false))) tags.push(webmcpRuntimeScript(webmcp));
+      return `location = /${a.id} { return 308 /${a.id}/; }\nlocation ^~ /${a.id}/ {\n proxy_pass http://127.0.0.1:${a.remotePort}/;\n proxy_http_version 1.1;\n proxy_set_header Host $host;\n proxy_set_header Upgrade $http_upgrade;\n proxy_set_header Connection $cag_p0_upgrade;\n proxy_set_header X-Forwarded-Proto https;\n proxy_set_header X-Forwarded-For $remote_addr;\n proxy_buffering off;\n${tags.length ? runtimeFilterAppConfig(tags) : ''} proxy_read_timeout 65s;\n proxy_connect_timeout 3s;\n client_max_body_size ${a.maxBody ?? defaultMaxBody};\n limit_req zone=cag_p0_requests burst=100 nodelay;\n limit_conn cag_p0_connections 50;\n add_header Cache-Control "no-store" always;\n add_header X-Content-Type-Options "nosniff" always;\n add_header Referrer-Policy "no-referrer" always;\n add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src ${hosts.map(h => `https://${h}/${a.id}/ wss://${h}/${a.id}/`).join(' ')}; media-src 'self' blob:; img-src 'self' data: blob:; font-src 'self' data:; frame-src ${hosts.map(h => `https://${h}/${a.id}/`).join(' ')} blob:; base-uri 'none'; form-action 'none'; worker-src 'self' blob:; object-src 'none'" always;\n}\n`;
+    }).join('')
   };
 }
