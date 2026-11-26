@@ -433,4 +433,30 @@ test('vendored webmcp-v1.js matches manifest sha256 and works end-to-end in VM h
       })),
     });
   }, /Maximum WebMCP tools limit/);
+
+  // Follow-up: 64 tools with 1024-char descriptions are byte-capped <= 48 KiB on both tools_sync and ready
+  nav.modelContext.provideContext({
+    tools: Array.from({ length: 64 }, (_, i) => ({
+      name: `heavy_${i}`,
+      description: 'D'.repeat(1024),
+      inputSchema: { type: 'object', properties: { x: { type: 'string' } } },
+      execute() { return i; },
+    })),
+  });
+  const syncHeavy = plain(posted.at(-1).msg);
+  assert.equal(syncHeavy.type, 'catsco.gateway.webmcp.tools_sync.v1');
+  assert.equal(syncHeavy.tools_truncated, true);
+  assert.ok(syncHeavy.tools.length < 64 && syncHeavy.tools.length > 0);
+  assert.ok(Buffer.byteLength(JSON.stringify(syncHeavy.tools), 'utf8') <= 48 * 1024);
+
+  dispatch('https://app.catsco.cc', {
+    contract_version: 'catsco.gateway-webmcp-bridge.v1',
+    type: 'catsco.gateway.webmcp.connect.v1',
+    session_id: 'sess-3',
+    request_id: 'req-3',
+  });
+  const readyHeavy = plain(posted.at(-1).msg);
+  assert.equal(readyHeavy.type, 'catsco.gateway.webmcp.ready.v1');
+  assert.equal(readyHeavy.tools_truncated, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(readyHeavy.tools), 'utf8') <= 48 * 1024);
 });

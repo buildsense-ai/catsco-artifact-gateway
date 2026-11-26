@@ -231,23 +231,50 @@
   var nativeModelContext = null;
   var shimInstalled = false;
 
-  function listDescriptors() {
-    var list = [];
+  function listDescriptorsBounded() {
+    var all = [];
     tools.forEach(function (entry) {
-      list.push(serializeDescriptor(entry));
+      all.push(serializeDescriptor(entry));
     });
-    return list;
+    try {
+      if (utf8ByteLength(JSON.stringify(all)) <= MAX_RESULT_JSON_BYTES) {
+        return { tools: all, truncated: false };
+      }
+    } catch (error) {
+      return { tools: [], truncated: all.length > 0 };
+    }
+    var fitted = [];
+    for (var i = 0; i < all.length; i++) {
+      fitted.push(all[i]);
+      try {
+        if (utf8ByteLength(JSON.stringify(fitted)) > MAX_RESULT_JSON_BYTES) {
+          fitted.pop();
+          break;
+        }
+      } catch (error) {
+        fitted.pop();
+        break;
+      }
+    }
+    return { tools: fitted, truncated: fitted.length < all.length };
+  }
+
+  function listDescriptors() {
+    return listDescriptorsBounded().tools;
   }
 
   function notifyToolsChanged() {
+    var bounded = listDescriptorsBounded();
     liveInstances.forEach(function (state) {
       if (state.connected && state.sessionId) {
-        state.post({
+        var msg = {
           contract_version: BRIDGE_CONTRACT,
           type: TYPE_TOOLS_SYNC,
           session_id: state.sessionId,
-          tools: listDescriptors(),
-        });
+          tools: bounded.tools,
+        };
+        if (bounded.truncated) msg.tools_truncated = true;
+        state.post(msg);
       }
     });
   }
@@ -389,15 +416,18 @@
           if (!validConnect(data)) return;
           state.connected = true;
           state.sessionId = data.session_id;
-          state.post({
+          var bounded = listDescriptorsBounded();
+          var readyMsg = {
             contract_version: BRIDGE_CONTRACT,
             type: TYPE_READY,
             session_id: data.session_id,
             request_id: data.request_id,
             runtime_version: 'webmcp-v1',
             capabilities: CAPABILITIES.slice(),
-            tools: listDescriptors(),
-          });
+            tools: bounded.tools,
+          };
+          if (bounded.truncated) readyMsg.tools_truncated = true;
+          state.post(readyMsg);
           return;
         }
 

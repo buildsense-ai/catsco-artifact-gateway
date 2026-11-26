@@ -3,8 +3,8 @@
   "runtime_path": "/_catsco/runtime/webmcp-v1.js",
   "config_attribute": "data-catsco-parent-origins",
   "source": "public/runtime/webmcp-v1.js",
-  "sha256": "da0086c9ab444974f0aedfcaacc1b77edc27902f2c3af9a94eeb68ec820938c1",
-  "bytes": 18217,
+  "sha256": "ca99846cafa162dfe31ce24d55573f6d077150456cdfe08c9e206b772ece7aea",
+  "bytes": 19153,
   "resources": [
     {
       "filename": "webmcp-v1.js",
